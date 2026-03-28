@@ -14,7 +14,6 @@
 namespace forge {
 
 static constexpr const char* kAppTitle = "Forge-Point";
-static constexpr const char* kTagline = "Local-first GGUF cockpit for llama.cpp";
 
 App::App()
     : screen_(ScreenInteractive::FullscreenAlternateScreen()),
@@ -28,11 +27,7 @@ App::App()
   fs::create_directories(runtime_dir_);
 
   search_query_ = "Qwen GGUF";
-  host_input_ = "127.0.0.1";
-  port_input_ = "8080";
-  extra_args_input_ = "-c 4096";
 
-  source_toggle_entries_ = {"Local GGUF", "HF Repo/File"};
   repo_entries_ = {"(none)"};
   file_entries_ = {"(none)"};
 
@@ -43,7 +38,7 @@ App::App()
   UpdateCommandSuggestions();
 
   logger_.Log("Forge-Point booted.");
-  logger_.Log("Drop a prebuilt llama.cpp release inside runtime/llama.cpp/ and Forge-Point will auto-detect llama-server.");
+  logger_.Log("Type /help for available commands.");
 }
 
 void App::Run() { screen_.Loop(root_); }
@@ -253,10 +248,21 @@ void App::DownloadSelectedFile() {
 void App::StartServer() {
   RefreshBinaryStatus();
   if (!binary_path_) {
-    logger_.Log("Cannot start server: llama-server not found.");
+    logger_.Log("Cannot start server: llama-server not found. Try /download-binary.");
     screen_.PostEvent(Event::Custom);
     return;
   }
+
+  std::string host = default_host_;
+  std::string port = default_port_;
+  std::string extra = default_extra_args_;
+
+  // Parse args: --host, --port, --extra-args
+  // These are already parsed by the command handler before calling StartServer
+  // We store them temporarily
+  // Actually, StartServer is called directly. Let's parse from last_command_args_.
+  // Better approach: the /start handler parses args and we read them here.
+  // For now we use defaults. The /start command handler will set them before calling.
 
   guard_.Request("Start llama-server", DescribeServerLaunch(), true, [this] {
     auto log_fn = [this](const std::string& chunk) {
@@ -264,32 +270,27 @@ void App::StartServer() {
       screen_.PostEvent(Event::Custom);
     };
     bool ok = false;
-    if (source_mode_ == 0) {
+    if (active_view_ == View::Hub || (!hf_repos_.empty() && !repo_files_.empty() &&
+        repo_selected_ < static_cast<int>(hf_repos_.size()) &&
+        file_selected_ < static_cast<int>(repo_files_.size()))) {
+      ok = server_manager_.StartWithHfRepo(*binary_path_,
+                                            hf_repos_[repo_selected_].id,
+                                            repo_files_[file_selected_].filename,
+                                            default_host_, default_port_,
+                                            default_extra_args_, log_fn,
+                                            last_command_preview_);
+    } else {
       if (local_models_.empty() ||
           local_selected_ >= static_cast<int>(local_models_.size())) {
-        logger_.Log("Choose a local GGUF first.");
+        logger_.Log("No model selected. Use /models to browse, /select N to pick one.");
         screen_.PostEvent(Event::Custom);
         return;
       }
       ok = server_manager_.StartWithLocalModel(*binary_path_,
                                                 local_models_[local_selected_].path,
-                                                host_input_, port_input_,
-                                                extra_args_input_, log_fn,
+                                                default_host_, default_port_,
+                                                default_extra_args_, log_fn,
                                                 last_command_preview_);
-    } else {
-      if (hf_repos_.empty() || repo_files_.empty() ||
-          repo_selected_ >= static_cast<int>(hf_repos_.size()) ||
-          file_selected_ >= static_cast<int>(repo_files_.size())) {
-        logger_.Log("Choose a repo and GGUF file first.");
-        screen_.PostEvent(Event::Custom);
-        return;
-      }
-      ok = server_manager_.StartWithHfRepo(*binary_path_,
-                                            hf_repos_[repo_selected_].id,
-                                            repo_files_[file_selected_].filename,
-                                            host_input_, port_input_,
-                                            extra_args_input_, log_fn,
-                                            last_command_preview_);
     }
     if (ok) {
       logger_.Log("Server starting...");
@@ -304,21 +305,25 @@ void App::StartServer() {
 
 std::string App::DescribeServerLaunch() const {
   std::ostringstream oss;
-  oss << "Host: " << host_input_ << '\n';
-  oss << "Port: " << port_input_ << '\n';
-  oss << "Args: " << extra_args_input_ << '\n';
-  if (source_mode_ == 0 && !local_models_.empty() &&
-      local_selected_ < static_cast<int>(local_models_.size())) {
-    oss << "Mode: Local GGUF\n";
-    oss << "Model: " << local_models_[local_selected_].path.string();
-  } else if (source_mode_ == 1 && !hf_repos_.empty() && !repo_files_.empty() &&
-             repo_selected_ < static_cast<int>(hf_repos_.size()) &&
-             file_selected_ < static_cast<int>(repo_files_.size())) {
+  oss << "Host: " << default_host_ << '\n';
+  oss << "Port: " << default_port_ << '\n';
+  oss << "Args: " << default_extra_args_ << '\n';
+
+  bool has_hf = !hf_repos_.empty() && !repo_files_.empty() &&
+                repo_selected_ < static_cast<int>(hf_repos_.size()) &&
+                file_selected_ < static_cast<int>(repo_files_.size());
+  bool has_local = !local_models_.empty() &&
+                   local_selected_ < static_cast<int>(local_models_.size());
+
+  if (active_view_ == View::Hub && has_hf) {
     oss << "Mode: HF Repo/File\n";
     oss << "Repo: " << hf_repos_[repo_selected_].id << '\n';
     oss << "File: " << repo_files_[file_selected_].filename;
+  } else if (has_local) {
+    oss << "Mode: Local GGUF\n";
+    oss << "Model: " << local_models_[local_selected_].path.string();
   } else {
-    oss << "Mode: (target not fully selected)";
+    oss << "Mode: (no model selected — use /select N)";
   }
   return oss.str();
 }
@@ -341,49 +346,71 @@ void App::StopServer() {
 }
 
 void App::CheckHealth() {
-  health_status_ = server_manager_.Health(host_input_, port_input_);
+  health_status_ = server_manager_.Health(default_host_, default_port_);
   logger_.Log("Health: " + health_status_);
   screen_.PostEvent(Event::Custom);
 }
 
 void App::ShowWelcome() {
   show_welcome_ = true;
-  logger_.Log("Welcome screen opened.");
   screen_.PostEvent(Event::Custom);
 }
 
 void App::HideWelcome() {
   if (show_welcome_) {
     show_welcome_ = false;
-    logger_.Log("Welcome screen dismissed.");
     screen_.PostEvent(Event::Custom);
   }
 }
 
-void App::CyclePanel(int delta) {
-  const int count = static_cast<int>(Panel::COUNT);
-  active_panel_ = static_cast<Panel>((static_cast<int>(active_panel_) + delta + count) % count);
-  FocusActivePanel();
+void App::SwitchView(std::string_view name) {
+  if (name == "vibecode" || name == "logs") {
+    active_view_ = View::Vibecode;
+    logger_.Log("[view] vibecode");
+  } else if (name == "models" || name == "local") {
+    active_view_ = View::Models;
+    logger_.Log("[view] models");
+  } else if (name == "hub") {
+    active_view_ = View::Hub;
+    logger_.Log("[view] hub");
+  } else {
+    logger_.Log("Unknown view: " + std::string(name) + ". Try: vibecode, models, hub");
+  }
+  FocusActiveView();
+  screen_.PostEvent(Event::Custom);
 }
 
-void App::FocusActivePanel() {
-  switch (active_panel_) {
-    case Panel::Local:   local_menu_->TakeFocus(); break;
-    case Panel::Hub:     search_input_->TakeFocus(); break;
-    case Panel::Server:  host_input_component_->TakeFocus(); break;
-    case Panel::Command: command_input_component_->TakeFocus(); break;
-    default: break;
-  }
+void App::FocusActiveView() {
+  // In the new design, arrow keys are handled globally based on active_view_.
+  // Focus stays on command_input_ for typing, but arrows work in any view.
+  command_input_component_->TakeFocus();
 }
 
 // ─── Commands ────────────────────────────────────────────────────────────────
 
 void App::RegisterCommands() {
   command_handler_.Register("/help", [this](const auto&) {
-    logger_.Log("Slash commands:");
+    logger_.Log("Commands:");
     for (const auto& item : command_registry_.GetAll()) {
-      logger_.Log("  " + item.usage + " — " + item.description);
+      logger_.Log("  " + item.usage + "  " + item.description);
     }
+  });
+
+  command_handler_.Register("/vibecode", [this](const auto&) { SwitchView("vibecode"); });
+  command_handler_.Register("/logs", [this](const auto&) { SwitchView("vibecode"); });
+
+  command_handler_.Register("/models", [this](const auto&) {
+    RefreshLocalModels();
+    SwitchView("models");
+  });
+
+  command_handler_.Register("/hub", [this](const auto& args) {
+    if (!args.empty()) {
+      search_query_ = args[0];
+      for (size_t i = 1; i < args.size(); ++i) search_query_ += " " + args[i];
+      SearchRepos();
+    }
+    SwitchView("hub");
   });
 
   command_handler_.Register("/search", [this](const auto& args) {
@@ -392,11 +419,65 @@ void App::RegisterCommands() {
       for (size_t i = 1; i < args.size(); ++i) search_query_ += " " + args[i];
     }
     SearchRepos();
+    if (active_view_ != View::Hub) SwitchView("hub");
   });
 
   command_handler_.Register("/files", [this](const auto&) { LoadRepoFiles(); });
   command_handler_.Register("/download", [this](const auto&) { DownloadSelectedFile(); });
-  command_handler_.Register("/start", [this](const auto&) { StartServer(); });
+
+  command_handler_.Register("/select", [this](const auto& args) {
+    if (args.empty()) {
+      logger_.Log("Usage: /select <index>  (0-based)");
+      screen_.PostEvent(Event::Custom);
+      return;
+    }
+    int idx = 0;
+    try { idx = std::stoi(args[0]); } catch (...) {
+      logger_.Log("Invalid index: " + args[0]);
+      screen_.PostEvent(Event::Custom);
+      return;
+    }
+    if (active_view_ == View::Models || active_view_ == View::Vibecode) {
+      if (idx >= 0 && idx < static_cast<int>(local_models_.size())) {
+        local_selected_ = idx;
+        logger_.Log("Selected model: " + local_models_[idx].name);
+      } else {
+        logger_.Log("Model index out of range. Use /models to see the list.");
+      }
+    } else if (active_view_ == View::Hub) {
+      if (!repo_entries_.empty() && repo_entries_[0] != "(none)") {
+        if (idx >= 0 && idx < static_cast<int>(hf_repos_.size())) {
+          repo_selected_ = idx;
+          logger_.Log("Selected repo: " + hf_repos_[idx].id);
+        } else {
+          logger_.Log("Repo index out of range.");
+        }
+      }
+    }
+    screen_.PostEvent(Event::Custom);
+  });
+
+  command_handler_.Register("/start", [this](const auto& args) {
+    // Parse --host, --port, --extra-args from args
+    std::string host = default_host_;
+    std::string port = default_port_;
+    std::string extra = default_extra_args_;
+
+    for (size_t i = 0; i < args.size(); ++i) {
+      if (args[i] == "--host" && i + 1 < args.size()) {
+        host = args[++i];
+      } else if (args[i] == "--port" && i + 1 < args.size()) {
+        port = args[++i];
+      } else if (args[i] == "--extra-args" && i + 1 < args.size()) {
+        extra = args[++i];
+      }
+    }
+    default_host_ = host;
+    default_port_ = port;
+    default_extra_args_ = extra;
+    StartServer();
+  });
+
   command_handler_.Register("/stop", [this](const auto&) { StopServer(); });
   command_handler_.Register("/health", [this](const auto&) { CheckHealth(); });
   command_handler_.Register("/rescan", [this](const auto&) { RefreshLocalModels(); });
@@ -436,45 +517,21 @@ void App::RegisterCommands() {
     screen_.PostEvent(Event::Custom);
   });
 
-  command_handler_.Register("/focus", [this](const auto& args) {
-    const std::string target = args.empty() ? "" : util::ToLower(args[0]);
-    if (target == "search" || target == "hub") {
-      active_panel_ = Panel::Hub;
-    } else if (target == "models" || target == "local") {
-      active_panel_ = Panel::Local;
-    } else if (target == "server") {
-      active_panel_ = Panel::Server;
-    } else {
-      active_panel_ = Panel::Command;
-    }
-    FocusActivePanel();
-    logger_.Log("Focus moved to " + (target.empty() ? std::string("command") : target) + ".");
-    screen_.PostEvent(Event::Custom);
+  command_handler_.Register("/quit", [this](const auto&) {
+    screen_.ExitLoopClosure()();
   });
 }
 
 // ─── UI building ─────────────────────────────────────────────────────────────
 
 void App::BuildUi() {
-  search_input_ = Input(&search_query_, "Qwen GGUF / org/model");
-  host_input_component_ = Input(&host_input_, "127.0.0.1");
-  port_input_component_ = Input(&port_input_, "8080");
-  extra_args_component_ = Input(&extra_args_input_, "-c 4096");
   command_input_component_ = Input(&command_input_, "/help, /search, /start...");
 
   local_menu_ = Menu(&local_model_entries_, &local_selected_);
   repo_menu_ = Menu(&repo_entries_, &repo_selected_);
   file_menu_ = Menu(&file_entries_, &file_selected_);
-  source_toggle_ = Toggle(&source_toggle_entries_, &source_mode_);
-
-  auto local_panel = Container::Vertical({local_menu_, source_toggle_});
-  auto hub_panel = Container::Vertical({search_input_, repo_menu_, file_menu_});
-  auto server_panel = Container::Vertical({host_input_component_, port_input_component_, extra_args_component_});
 
   root_container_ = Container::Vertical({
-      local_panel,
-      hub_panel,
-      server_panel,
       command_input_component_,
   });
 
@@ -491,8 +548,7 @@ void App::BuildUi() {
     if (show_welcome_) {
       if (event == Event::Return || event == Event::Escape || event == Event::Character(' ')) {
         HideWelcome();
-        active_panel_ = Panel::Command;
-        FocusActivePanel();
+        command_input_component_->TakeFocus();
         return true;
       }
       return true;
@@ -512,20 +568,28 @@ void App::BuildUi() {
       return true;
     }
 
+    // Escape focuses command input
+    if (event == Event::Escape) {
+      command_input_component_->TakeFocus();
+      return true;
+    }
+
+    // Tab: accept autocomplete or toggle hub list focus
     if (event == Event::Tab) {
       if (command_input_component_->Focused() && !command_input_.empty() && command_input_.front() == '/') {
         AcceptSuggestion();
         return true;
       }
-      CyclePanel(1);
+      // In Hub view, Tab toggles between repo and file lists
+      if (active_view_ == View::Hub && !hf_repos_.empty() && !repo_files_.empty()) {
+        hub_focus_on_files_ = !hub_focus_on_files_;
+        screen_.PostEvent(Event::Custom);
+        return true;
+      }
       return true;
     }
 
-    if (event == Event::TabReverse) {
-      CyclePanel(-1);
-      return true;
-    }
-
+    // Ctrl+Y toggles YOLO
     if (event == Event::Special({25})) {
       guard_.ToggleYolo();
       logger_.Log(std::string("YOLO mode ") + (guard_.YoloMode() ? "enabled." : "disabled."));
@@ -533,58 +597,109 @@ void App::BuildUi() {
       return true;
     }
 
-    if (event == Event::Character('q') || event == Event::CtrlC) {
-      if (command_input_component_->Focused() || search_input_->Focused() ||
-          host_input_component_->Focused() || port_input_component_->Focused() ||
-          extra_args_component_->Focused()) {
-        if (event == Event::Character('q')) return false;
-      }
+    // Ctrl+C always quits
+    if (event == Event::CtrlC) {
       screen_.ExitLoopClosure()();
       return true;
     }
 
+    // q quits only when command input is focused and empty
+    if (event == Event::Character('q')) {
+      if (command_input_component_->Focused() && command_input_.empty()) {
+        screen_.ExitLoopClosure()();
+        return true;
+      }
+      if (!command_input_component_->Focused()) {
+        // q in a menu → focus command input, don't quit
+        command_input_component_->TakeFocus();
+        return true;
+      }
+      return false;  // let 'q' be typed into input
+    }
+
+    // / starts typing a command (from anywhere)
     if (event == Event::Character('/')) {
-      OpenCommandPalette();
+      if (command_input_.empty()) command_input_ = "/";
+      command_input_component_->TakeFocus();
+      UpdateCommandSuggestions();
       return true;
     }
 
-    if (event == Event::Escape) {
-      active_panel_ = Panel::Command;
-      FocusActivePanel();
-      return true;
-    }
-
+    // Enter: act on selected item in Models/Hub views FIRST, then execute command
     if (event == Event::Return) {
+      // In Models view, Enter selects the highlighted model
+      if (active_view_ == View::Models && !local_models_.empty() &&
+          local_selected_ >= 0 && local_selected_ < static_cast<int>(local_models_.size())) {
+        logger_.Log("Selected model: " + local_models_[local_selected_].name);
+        screen_.PostEvent(Event::Custom);
+        return true;
+      }
+      // In Hub view, Enter on repos loads files, Enter on files downloads
+      if (active_view_ == View::Hub) {
+        if (!hub_focus_on_files_ && !hf_repos_.empty()) {
+          LoadRepoFiles();
+          return true;
+        }
+        if (hub_focus_on_files_ && !repo_files_.empty()) {
+          DownloadSelectedFile();
+          return true;
+        }
+      }
+      // Otherwise execute command input
       if (command_input_component_->Focused()) {
+        if (!command_input_.empty() && command_input_.front() == '/') {
+          AcceptSuggestion();
+        }
         ExecuteCommandInput();
         return true;
       }
-      if (search_input_->Focused()) {
-        SearchRepos();
-        return true;
-      }
-      if (repo_menu_->Focused()) {
-        LoadRepoFiles();
-        return true;
-      }
-      if (file_menu_->Focused()) {
-        DownloadSelectedFile();
-        return true;
-      }
-      if (local_menu_->Focused()) {
-        if (!local_models_.empty() && local_selected_ >= 0 &&
-            local_selected_ < static_cast<int>(local_models_.size())) {
-          source_mode_ = 0;
-          logger_.Log("Selected: " + local_models_[local_selected_].name);
-          screen_.PostEvent(Event::Custom);
-        }
-        return true;
-      }
+      return true;
     }
 
-    if (command_input_component_->Focused()) {
-      if (event == Event::ArrowDown) { MoveSuggestion(1); return true; }
-      if (event == Event::ArrowUp) { MoveSuggestion(-1); return true; }
+    // Arrow up/down: navigate menus in Models/Hub views FIRST, then command input
+    if (event == Event::ArrowUp || event == Event::ArrowDown) {
+      // In Models view, always navigate local models list
+      if (active_view_ == View::Models && !local_models_.empty()) {
+        if (event == Event::ArrowUp) {
+          local_selected_ = std::max(0, local_selected_ - 1);
+        } else {
+          local_selected_ = std::min(static_cast<int>(local_models_.size()) - 1, local_selected_ + 1);
+        }
+        screen_.PostEvent(Event::Custom);
+        return true;
+      }
+      // In Hub view, always navigate repo or file list based on Tab toggle
+      if (active_view_ == View::Hub && !hf_repos_.empty()) {
+        if (!hub_focus_on_files_) {
+          // Navigate repos
+          if (event == Event::ArrowUp) {
+            repo_selected_ = std::max(0, repo_selected_ - 1);
+          } else {
+            repo_selected_ = std::min(static_cast<int>(hf_repos_.size()) - 1, repo_selected_ + 1);
+          }
+          screen_.PostEvent(Event::Custom);
+          return true;
+        }
+        // Navigate files (if loaded)
+        if (!repo_files_.empty()) {
+          if (event == Event::ArrowUp) {
+            file_selected_ = std::max(0, file_selected_ - 1);
+          } else {
+            file_selected_ = std::min(static_cast<int>(repo_files_.size()) - 1, file_selected_ + 1);
+          }
+          screen_.PostEvent(Event::Custom);
+          return true;
+        }
+      }
+      // In Vibecode view or empty lists, use arrows for command input autocomplete
+      if (command_input_component_->Focused()) {
+        if (!command_input_.empty() && command_input_.front() == '/') {
+          MoveSuggestion(event == Event::ArrowDown ? 1 : -1);
+          return true;
+        }
+        return false;  // let input handle arrow keys for cursor movement
+      }
+      return false;
     }
 
     return false;
@@ -596,12 +711,6 @@ void App::BuildUi() {
     }
     return false;
   });
-}
-
-void App::OpenCommandPalette() {
-  if (command_input_.empty() || command_input_.front() != '/') command_input_ = "/";
-  command_input_component_->TakeFocus();
-  UpdateCommandSuggestions();
 }
 
 void App::MoveSuggestion(int delta) {
@@ -656,33 +765,259 @@ void App::ExecuteCommandInput() {
 Element App::BuildMainScreen() {
   UpdateCommandSuggestions();
 
-  auto logs_copy = logger_.GetLogs();
-  const size_t start = logs_copy.size() > 80 ? logs_copy.size() - 80 : 0;
-  std::ostringstream log_stream;
-  for (size_t i = start; i < logs_copy.size(); ++i) {
-    log_stream << logs_copy[i];
-    if (i + 1 < logs_copy.size()) log_stream << '\n';
-  }
-
   Elements layout;
-  layout.push_back(BuildHeader());
-  layout.push_back(separator());
-  layout.push_back(hbox({BuildLocalPanel() | flex, BuildHubPanel() | flex, BuildServerPanel() | flex}));
+  layout.push_back(BuildStatusBar());
   layout.push_back(separator());
 
+  // View content
+  Element view_content;
+  switch (active_view_) {
+    case View::Vibecode: view_content = BuildVibecodeView(); break;
+    case View::Models:   view_content = BuildModelsView(); break;
+    case View::Hub:      view_content = BuildHubView(); break;
+  }
+  layout.push_back(view_content | flex);
+
+  // Transfers (inline if active)
   auto transfers_el = BuildTransfers();
   if (transfers_el) {
-    layout.push_back(*transfers_el);
     layout.push_back(separator());
+    layout.push_back(*transfers_el);
   }
 
-  layout.push_back(window(text("Logs"), paragraph(log_stream.str().empty() ? "(no logs yet)" : log_stream.str()) | frame | size(HEIGHT, GREATER_THAN, 12)));
   layout.push_back(separator());
-  layout.push_back(BuildCommandPalette());
-  layout.push_back(separator());
-  layout.push_back(text("q quit · / commands · Tab cycle panels · Esc focus command · Ctrl+Y yolo · Enter act") | dim);
+  layout.push_back(BuildCommandInput());
 
   return vbox(std::move(layout)) | border;
+}
+
+Element App::BuildStatusBar() const {
+  // Server chip
+  bool running = server_manager_.Running();
+  Element server_chip = text(running ? " ● RUNNING " : " ○ STOPPED ") |
+                        bold |
+                        color(Color::Black) |
+                        bgcolor(running ? Color::GreenLight : Color::RedLight);
+
+  // YOLO chip (only shown when ON)
+  Element yolo_chip = text("");
+  if (guard_.YoloMode()) {
+    yolo_chip = hbox({
+        text(" "),
+        text(" YOLO ") | bold | color(Color::Black) | bgcolor(Color::YellowLight),
+    });
+  }
+
+  // Transfers summary
+  Element transfers_chip = text("");
+  auto active = transfers_.GetActive();
+  if (!active.empty()) {
+    transfers_chip = hbox({
+        text(" "),
+        text(" ↓" + std::to_string(active.size()) + " ") | bold | color(Color::Black) | bgcolor(Color::CyanLight),
+    });
+  }
+
+  // View name
+  std::string view_name;
+  switch (active_view_) {
+    case View::Vibecode: view_name = "vibecode"; break;
+    case View::Models:   view_name = "models"; break;
+    case View::Hub:      view_name = "hub"; break;
+  }
+
+  return hbox({
+      text(kAppTitle) | bold | color(Color::CyanLight),
+      text(" "),
+      server_chip,
+      yolo_chip,
+      transfers_chip,
+      filler(),
+      text("[") | dim,
+      text(view_name) | color(Color::CyanLight),
+      text("]") | dim,
+  });
+}
+
+Element App::BuildVibecodeView() const {
+  auto logs_copy = logger_.GetLogs();
+  const size_t start = logs_copy.size() > 200 ? logs_copy.size() - 200 : 0;
+  Elements log_lines;
+  for (size_t i = start; i < logs_copy.size(); ++i) {
+    Color c = Color::GrayLight;
+    const std::string& line = logs_copy[i];
+    if (line.rfind("$ ", 0) == 0) {
+      c = Color::CyanLight;
+    } else if (line.find("error") != std::string::npos || line.find("failed") != std::string::npos || line.find("Error") != std::string::npos) {
+      c = Color::RedLight;
+    } else if (line.find("[view]") != std::string::npos) {
+      c = Color::YellowLight;
+    } else if (line.rfind("Server", 0) == 0 || line.find("starting") != std::string::npos) {
+      c = Color::GreenLight;
+    }
+    log_lines.push_back(text(line) | color(c));
+  }
+  if (log_lines.empty()) {
+    log_lines.push_back(text("Ready. Type /help to get started.") | dim);
+  }
+  return vbox(std::move(log_lines)) | frame;
+}
+
+Element App::BuildModelsView() {
+  Elements rows;
+
+  if (local_models_.empty()) {
+    rows.push_back(text("No local GGUF models found.") | dim);
+    rows.push_back(text(""));
+    rows.push_back(text("Try:") | dim);
+    rows.push_back(text("  /download-binary   — get llama.cpp") | color(Color::CyanLight));
+    rows.push_back(text("  /hub <query>       — search Hugging Face") | color(Color::CyanLight));
+    rows.push_back(text("  /rescan            — rescan models/ directory") | color(Color::CyanLight));
+  } else {
+    rows.push_back(text("Models ") | bold | color(Color::CyanLight));
+    rows.push_back(text("← [navigate]") | color(Color::YellowLight));
+    rows.push_back(text("  (Enter: select)") | dim);
+    rows.push_back(text(""));
+
+    for (int i = 0; i < static_cast<int>(local_models_.size()); ++i) {
+      const auto& m = local_models_[i];
+      bool selected = (i == local_selected_);
+      Element row = hbox({
+          text(selected ? "▸ " : "  ") | color(Color::CyanLight),
+          text(m.name) | (selected ? bold : nothing),
+          text(" ["),
+          text(util::HumanBytes(m.size)) | color(Color::GreenLight),
+          text("]"),
+      });
+      if (selected) row = row | bgcolor(Color::GrayDark);
+      rows.push_back(row);
+    }
+
+    if (local_selected_ >= 0 && local_selected_ < static_cast<int>(local_models_.size())) {
+      const auto& m = local_models_[local_selected_];
+      rows.push_back(text(""));
+      rows.push_back(hbox({text("path:   ") | dim, text(m.path.string()) | color(Color::White)}));
+      rows.push_back(hbox({text("origin: ") | dim, text(m.origin) | color(Color::White)}));
+      rows.push_back(hbox({text("size:   ") | dim, text(util::HumanBytes(m.size)) | color(Color::White)}));
+    }
+  }
+
+  rows.push_back(text(""));
+  rows.push_back(text("/select N · /start · /rescan · /hub") | dim);
+
+  return vbox(std::move(rows));
+}
+
+Element App::BuildHubView() {
+  Elements rows;
+
+  // Search header
+  rows.push_back(hbox({
+      text("search: ") | dim,
+      text(search_query_) | color(Color::CyanLight) | bold,
+      text("  (/search <query> to change)") | dim,
+  }));
+  rows.push_back(text(""));
+
+  if (hf_repos_.empty() || (repo_entries_.size() == 1 && repo_entries_[0] == "(none)")) {
+    rows.push_back(text("No search results yet.") | dim);
+    rows.push_back(text(""));
+    rows.push_back(text("Try:  /search <query>") | color(Color::CyanLight));
+  } else {
+    // Repos
+    bool repos_focused = !hub_focus_on_files_;
+    rows.push_back(text("Repos ") | bold | color(repos_focused ? Color::CyanLight : Color::White));
+    if (repos_focused) rows.push_back(text("← [navigate]") | color(Color::YellowLight));
+    rows.push_back(text("  (Enter: list files)") | dim);
+    rows.push_back(text(""));
+
+    for (int i = 0; i < static_cast<int>(hf_repos_.size()); ++i) {
+      const auto& repo = hf_repos_[i];
+      bool selected = (i == repo_selected_);
+      Element row = hbox({
+          text(selected ? "▸ " : "  ") | color(Color::CyanLight),
+          text(repo.id) | (selected ? bold : nothing),
+          text(" ↓"),
+          text(std::to_string(repo.downloads)) | color(Color::GreenLight),
+          text(" ♥"),
+          text(std::to_string(repo.likes)) | color(Color::RedLight),
+      });
+      if (selected) row = row | bgcolor(Color::GrayDark);
+      rows.push_back(row);
+    }
+
+    if (repo_selected_ >= 0 && repo_selected_ < static_cast<int>(hf_repos_.size())) {
+      const auto& repo = hf_repos_[repo_selected_];
+      rows.push_back(text(""));
+      rows.push_back(hbox({text("  id:   ") | dim, text(repo.id) | color(Color::White)}));
+      rows.push_back(hbox({text("  sha:  ") | dim, text(repo.sha.empty() ? "(unknown)" : repo.sha) | color(Color::White)}));
+    }
+
+    // Files
+    if (!repo_files_.empty() && !(repo_files_.size() == 1 && file_entries_[0] == "(none)")) {
+      rows.push_back(text(""));
+      bool files_focused = hub_focus_on_files_;
+      rows.push_back(text("GGUF Files ") | bold | color(files_focused ? Color::CyanLight : Color::White));
+      if (files_focused) rows.push_back(text("← [navigate]") | color(Color::YellowLight));
+      rows.push_back(text("  (Enter: download)") | dim);
+      rows.push_back(text(""));
+
+      for (int i = 0; i < static_cast<int>(repo_files_.size()); ++i) {
+        const auto& file = repo_files_[i];
+        bool selected = (i == file_selected_);
+        std::string size_str = file.size > 0 ? util::HumanBytes(file.size) : "?";
+        Element row = hbox({
+            text(selected ? "▸ " : "  ") | color(Color::CyanLight),
+            text(file.filename) | (selected ? bold : nothing),
+            text(" ["),
+            text(size_str) | color(Color::GreenLight),
+            text("]"),
+        });
+        if (selected) row = row | bgcolor(Color::GrayDark);
+        rows.push_back(row);
+      }
+    }
+  }
+
+  rows.push_back(text(""));
+  rows.push_back(text("/search · /files · /download · /start") | dim);
+
+  return vbox(std::move(rows));
+}
+
+Element App::BuildCommandInput() {
+  // Autocomplete suggestions
+  Elements suggestion_rows;
+  if (!command_input_.empty() && command_input_.front() == '/') {
+    UpdateCommandSuggestions();
+    for (size_t i = 0; i < command_suggestions_.size() && i < 5; ++i) {
+      const auto& cmd = command_suggestions_[i];
+      bool selected = (static_cast<int>(i) == command_selected_);
+      Element row = hbox({
+          text("  "),
+          text(cmd.usage) | bold | (selected ? color(Color::CyanLight) : color(Color::White)),
+          text("  ") | dim,
+          text(cmd.description) | dim,
+      });
+      if (selected) row = row | bgcolor(Color::GrayDark);
+      suggestion_rows.push_back(row);
+    }
+  }
+
+  Element input_line = hbox({
+      text(" $ ") | color(Color::CyanLight) | bold,
+      command_input_component_->Render(),
+  });
+
+  if (suggestion_rows.empty()) {
+    return input_line;
+  }
+
+  return vbox({
+      vbox(std::move(suggestion_rows)),
+      separator(),
+      input_line,
+  });
 }
 
 std::optional<Element> App::BuildTransfers() {
@@ -691,167 +1026,29 @@ std::optional<Element> App::BuildTransfers() {
 
   Elements rows;
   for (const auto& t : active) {
-    std::string status_text;
     if (t.total > 0) {
       double pct = static_cast<double>(t.downloaded) / static_cast<double>(t.total);
-      status_text = util::HumanBytes(t.downloaded) + " / " + util::HumanBytes(t.total) +
-                    " (" + std::to_string(static_cast<int>(pct * 100.0)) + "%)";
+      std::string status = util::HumanBytes(t.downloaded) + " / " + util::HumanBytes(t.total) +
+                           " (" + std::to_string(static_cast<int>(pct * 100.0)) + "%)";
       rows.push_back(hbox({
-          text(t.label + " ") | bold,
-          gauge(static_cast<float>(pct)) | flex,
-          text(" " + status_text),
+          text("↓ ") | color(Color::CyanLight),
+          text(t.label) | bold,
+          text(" "),
+          gauge(static_cast<float>(pct)) | flex | color(Color::CyanLight),
+          text(" " + status),
       }));
     } else {
-      status_text = util::HumanBytes(t.downloaded) + " downloaded...";
+      std::string status = util::HumanBytes(t.downloaded) + "...";
       rows.push_back(hbox({
-          text(t.label + " ") | bold,
+          text("↓ ") | color(Color::CyanLight),
+          text(t.label) | bold,
+          text(" "),
           spinner(4, static_cast<int>(t.downloaded / 65536) % 4),
-          text(" " + status_text) | dim,
+          text(" " + status) | dim,
       }));
     }
   }
-  return window(text("Transfers"), vbox(std::move(rows)));
-}
-
-Element App::BuildHeader() const {
-  Element yolo_chip = text(guard_.YoloMode() ? " YOLO ON " : " YOLO OFF ") |
-                      bold |
-                      color(guard_.YoloMode() ? Color::Black : Color::White) |
-                      bgcolor(guard_.YoloMode() ? Color::YellowLight : Color::GrayDark);
-
-  Element server_chip = text(server_manager_.Running() ? " SERVER RUNNING " : " SERVER STOPPED ") |
-                        bold |
-                        color(server_manager_.Running() ? Color::Black : Color::White) |
-                        bgcolor(server_manager_.Running() ? Color::GreenLight : Color::RedLight);
-
-  return hbox({
-      vbox({
-          text(kAppTitle) | bold | color(Color::CyanLight),
-          text(kTagline) | dim,
-      }) | flex,
-      hbox({server_chip, text(" "), yolo_chip}),
-  });
-}
-
-Element App::BuildLocalPanel() const {
-  std::string details = "No local model selected.";
-  if (!local_models_.empty() && local_selected_ >= 0 &&
-      local_selected_ < static_cast<int>(local_models_.size())) {
-    const auto& m = local_models_[local_selected_];
-    details = m.path.string() + "\norigin: " + m.origin + "\nsize: " + util::HumanBytes(m.size);
-  }
-
-  bool active = (active_panel_ == Panel::Local);
-  Element title = active ? (text("▸ Local GGUFs") | color(Color::CyanLight)) : text("Local GGUFs");
-
-  return window(title,
-                vbox({
-                    hbox({text("HF cache: "), text(scanner_.CacheRoot().string()) | dim}) | flex,
-                    separator(),
-                    local_menu_->Render() | frame | size(HEIGHT, LESS_THAN, 12),
-                    separator(),
-                    paragraph(details),
-                    separator(),
-                    text("/rescan · /download-binary · Enter select") | dim,
-                }));
-}
-
-Element App::BuildHubPanel() const {
-  std::string repo_detail = "No repo selected.";
-  if (!hf_repos_.empty() && repo_selected_ >= 0 &&
-      repo_selected_ < static_cast<int>(hf_repos_.size())) {
-    const auto& repo = hf_repos_[repo_selected_];
-    repo_detail = repo.id + "\ndownloads: " + std::to_string(repo.downloads) +
-                  "\nlikes: " + std::to_string(repo.likes) +
-                  "\nsha: " + (repo.sha.empty() ? "(unknown)" : repo.sha);
-  }
-
-  std::string file_detail = "No GGUF file selected.";
-  if (!repo_files_.empty() && file_selected_ >= 0 &&
-      file_selected_ < static_cast<int>(repo_files_.size())) {
-    const auto& file = repo_files_[file_selected_];
-    file_detail = file.filename + "\nsize: " + util::HumanBytes(file.size) + "\n" + file.download_url;
-  }
-
-  bool active = (active_panel_ == Panel::Hub);
-  Element title = active ? (text("▸ Hugging Face") | color(Color::CyanLight)) : text("Hugging Face");
-
-  return window(title,
-                vbox({
-                    search_input_->Render(),
-                    separator(),
-                    text("Repos (Enter → list files)") | bold,
-                    repo_menu_->Render() | frame | size(HEIGHT, LESS_THAN, 8),
-                    separator(),
-                    paragraph(repo_detail),
-                    separator(),
-                    text("GGUF files (Enter → download)") | bold,
-                    file_menu_->Render() | frame | size(HEIGHT, LESS_THAN, 8),
-                    separator(),
-                    paragraph(file_detail),
-                    separator(),
-                    text("/search · /files · /download") | dim,
-                }));
-}
-
-Element App::BuildServerPanel() const {
-  std::string target = source_mode_ == 0 ? "Local GGUF" : "HF Repo/File";
-  if (source_mode_ == 0 && !local_models_.empty() && local_selected_ >= 0 &&
-      local_selected_ < static_cast<int>(local_models_.size())) {
-    target += "\n" + local_models_[local_selected_].path.string();
-  }
-  if (source_mode_ == 1 && !hf_repos_.empty() && !repo_files_.empty() &&
-      repo_selected_ >= 0 && repo_selected_ < static_cast<int>(hf_repos_.size()) &&
-      file_selected_ >= 0 && file_selected_ < static_cast<int>(repo_files_.size())) {
-    target += "\nrepo: " + hf_repos_[repo_selected_].id +
-              "\nfile: " + repo_files_[file_selected_].filename;
-  }
-
-  bool active = (active_panel_ == Panel::Server);
-  Element title = active ? (text("▸ Server") | color(Color::CyanLight)) : text("Server");
-
-  return window(title,
-                vbox({
-                    text(binary_status_),
-                    separator(),
-                    source_toggle_->Render(),
-                    separator(),
-                    text("Target") | bold,
-                    paragraph(target),
-                    separator(),
-                    text("Host"), host_input_component_->Render(),
-                    text("Port"), port_input_component_->Render(),
-                    text("Extra args"), extra_args_component_->Render(),
-                    separator(),
-                    text("Health: " + health_status_),
-                    separator(),
-                    text("/start · /stop · /health") | dim,
-                }));
-}
-
-Element App::BuildCommandPalette() {
-  Elements suggestion_rows;
-  if (command_input_.empty()) {
-    suggestion_rows.push_back(text("Type / to open commands.") | dim);
-  } else if (command_suggestions_.empty()) {
-    suggestion_rows.push_back(text("No matching slash commands.") | dim);
-  } else {
-    for (size_t i = 0; i < command_suggestions_.size() && i < 6; ++i) {
-      const auto& cmd = command_suggestions_[i];
-      Element row = hbox({text(cmd.usage) | bold, text("  "), text(cmd.description) | dim});
-      if (static_cast<int>(i) == command_selected_) {
-        row = row | bgcolor(Color::Blue) | color(Color::White);
-      }
-      suggestion_rows.push_back(row);
-    }
-  }
-
-  return window(text("Slash command palette"),
-                vbox({
-                    command_input_component_->Render(),
-                    separator(),
-                    vbox(std::move(suggestion_rows)),
-                }));
+  return vbox(std::move(rows));
 }
 
 Element App::BuildConfirmOverlay() const {
@@ -863,7 +1060,7 @@ Element App::BuildConfirmOverlay() const {
                         vbox({
                             paragraph(guard_.Detail()),
                             separator(),
-                            text(guard_.YoloMode() ? "YOLO mode is on." : "Press Enter/Y to confirm, Esc/N to cancel.") | dim,
+                            text(guard_.YoloMode() ? "YOLO mode is on." : "Enter/Y confirm · Esc/N cancel") | dim,
                         })) | size(WIDTH, LESS_THAN, 72),
                  filler(),
              }),

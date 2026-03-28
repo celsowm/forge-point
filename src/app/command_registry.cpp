@@ -6,19 +6,23 @@ namespace forge {
 
 CommandRegistry::CommandRegistry()
     : commands_({
-          {"/help", "/help", "Show available slash commands."},
+          {"/help", "/help", "Show available commands."},
+          {"/vibecode", "/vibecode", "Switch to log/output view (default)."},
+          {"/models", "/models", "Browse local GGUF models."},
+          {"/hub", "/hub [query]", "Search Hugging Face repos."},
           {"/search", "/search <query>", "Search Hugging Face repos."},
           {"/files", "/files", "List GGUF files for the selected repo."},
-          {"/download", "/download", "Download the selected GGUF into models/."},
-          {"/start", "/start", "Launch llama-server with the selected target."},
+          {"/select", "/select <index>", "Select a model/repo/file by index."},
+          {"/download", "/download", "Download the selected GGUF file."},
+          {"/start", "/start [--host H] [--port P] [--extra-args ...]", "Launch llama-server."},
           {"/stop", "/stop", "Stop llama-server."},
           {"/health", "/health", "Check the /health endpoint."},
           {"/rescan", "/rescan", "Rescan local GGUFs and cache."},
-          {"/refresh-binary", "/refresh-binary", "Rescan runtime/llama.cpp for llama-server."},
+          {"/refresh-binary", "/refresh-binary", "Rescan runtime/ for llama-server."},
           {"/download-binary", "/download-binary", "Download llama.cpp for your GPU."},
           {"/yolo", "/yolo [on|off|toggle]", "Toggle confirmation-free mode."},
-          {"/welcome", "/welcome", "Show the splash screen again."},
-          {"/focus", "/focus <search|models|server|command>", "Move focus to a specific control."},
+          {"/welcome", "/welcome", "Show the splash screen."},
+          {"/quit", "/quit", "Quit Forge-Point."},
       }) {}
 
 const std::vector<SlashCommand>& CommandRegistry::GetAll() const {

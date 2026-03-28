@@ -56,23 +56,22 @@ class App {
   std::string DescribeServerLaunch() const;
   void ShowWelcome();
   void HideWelcome();
-  void CyclePanel(int delta);
-  void FocusActivePanel();
+  void SwitchView(std::string_view name);
+  void FocusActiveView();
 
   void BuildUi();
-  void OpenCommandPalette();
   void MoveSuggestion(int delta);
   void AcceptSuggestion();
   void UpdateCommandSuggestions();
   void ExecuteCommandInput();
 
   Element BuildMainScreen();
+  Element BuildStatusBar() const;
+  Element BuildVibecodeView() const;
+  Element BuildModelsView();
+  Element BuildHubView();
+  Element BuildCommandInput();
   std::optional<Element> BuildTransfers();
-  Element BuildHeader() const;
-  Element BuildLocalPanel() const;
-  Element BuildHubPanel() const;
-  Element BuildServerPanel() const;
-  Element BuildCommandPalette();
   Element BuildConfirmOverlay() const;
   Element BuildWelcomeScreen() const;
 
@@ -110,10 +109,11 @@ class App {
   bool show_welcome_ = true;
 
   std::string search_query_;
-  std::string host_input_;
-  std::string port_input_;
-  std::string extra_args_input_;
   std::string command_input_;
+
+  std::string default_host_ = "127.0.0.1";
+  std::string default_port_ = "8080";
+  std::string default_extra_args_ = "-c 4096";
 
   std::vector<LocalModel> local_models_;
   std::vector<HfRepo> hf_repos_;
@@ -123,30 +123,24 @@ class App {
   std::vector<std::string> local_model_entries_;
   std::vector<std::string> repo_entries_;
   std::vector<std::string> file_entries_;
-  std::vector<std::string> source_toggle_entries_;
   std::vector<SlashCommand> command_suggestions_;
 
   int local_selected_ = 0;
   int repo_selected_ = 0;
   int file_selected_ = 0;
-  int source_mode_ = 0;
   int command_selected_ = 0;
+  bool hub_focus_on_files_ = false;
 
-  enum class Panel { Local = 0, Hub, Server, Command, COUNT };
-  Panel active_panel_ = Panel::Command;
+  enum class View { Vibecode = 0, Models, Hub };
+  View active_view_ = View::Vibecode;
 
   // ─── FTXUI components ───────────────────────────────────────────────
   Component root_container_;
   Component root_;
-  Component search_input_;
-  Component host_input_component_;
-  Component port_input_component_;
-  Component extra_args_component_;
   Component command_input_component_;
   Component local_menu_;
   Component repo_menu_;
   Component file_menu_;
-  Component source_toggle_;
 
   // ─── UI queue ────────────────────────────────────────────────────────
   std::mutex ui_queue_mutex_;

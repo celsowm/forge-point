@@ -21,13 +21,12 @@ Element BuildWelcomeScreen() {
              line(R"(                 /____/                                  )", Color::RedLight),
              separator(),
              text("Forge-Point") | bold | center | color(Color::White),
-             text("A terminal cockpit for GGUF discovery, download, and llama.cpp server control.") | center | dim,
+             text("GGUF discovery, download, and llama.cpp server control.") | center | dim,
              separator(),
-             paragraphAlignCenter("Press Enter to enter the cockpit.") |
-                 size(WIDTH, LESS_THAN, 80),
+             paragraphAlignCenter("Press Enter to continue.") |
+                 size(WIDTH, LESS_THAN, 60),
              separator(),
-             text("/ opens the command palette · Tab cycles panels · Enter acts") | center | color(Color::CyanLight),
-             text("Ctrl+Y toggles YOLO mode · Esc returns to command palette") | center | dim,
+             text("/help for commands · Esc focus input · q quit") | center | color(Color::CyanLight),
              filler(),
          }) |
          border;
