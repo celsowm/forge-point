@@ -20,7 +20,6 @@ FetchContent_Declare(
 )
 
 FetchContent_MakeAvailable(ftxui json)
-find_package(CURL REQUIRED)
 
 add_executable(forge_point
   src/main.cpp
@@ -35,9 +34,9 @@ target_link_libraries(forge_point PRIVATE
   ftxui::dom
   ftxui::screen
   nlohmann_json::nlohmann_json
-  CURL::libcurl
 )
 
 if(WIN32)
   target_compile_definitions(forge_point PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_link_libraries(forge_point PRIVATE winhttp)
 endif()

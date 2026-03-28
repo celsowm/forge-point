@@ -4,7 +4,16 @@
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/dom/elements.hpp>
 
-#include <curl/curl.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <winhttp.h>
+#pragma comment(lib, "winhttp.lib")
+#else
+#include <csignal>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -15,6 +24,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -27,15 +37,6 @@
 #include <thread>
 #include <utility>
 #include <vector>
-
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <csignal>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#endif
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -141,7 +142,16 @@ fs::path DefaultHfCacheRoot() {
 #ifdef _WIN32
   const std::string local_app_data = GetEnv("LOCALAPPDATA");
   if (!local_app_data.empty()) {
-    return fs::path(local_app_data) / "huggingface" / "hub";
+    const fs::path win32_cache = fs::path(local_app_data) / "huggingface" / "hub";
+    if (fs::exists(win32_cache)) {
+      return win32_cache;
+    }
+  }
+  if (const auto home = HomeDirectory()) {
+    const fs::path win_cache = *home / ".cache" / "huggingface" / "hub";
+    if (fs::exists(win_cache)) {
+      return win_cache;
+    }
   }
 #endif
   const std::string xdg_cache_home = GetEnv("XDG_CACHE_HOME");
@@ -234,112 +244,267 @@ struct HttpResponse {
   std::string error;
 };
 
+using ProgressFn = std::function<void(uint64_t downloaded, uint64_t total)>;
+
 class HttpClient {
  public:
-  HttpClient() { curl_global_init(CURL_GLOBAL_DEFAULT); }
-  ~HttpClient() { curl_global_cleanup(); }
+  HttpClient() {}
+  ~HttpClient() {}
 
   HttpResponse Get(const std::string& url, const std::vector<std::string>& headers = {}) const {
     HttpResponse response;
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-      response.error = "curl_easy_init failed";
-      return response;
-    }
-
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &HttpClient::WriteString);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.body);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "forge-point/0.1");
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
-
-    struct curl_slist* header_list = nullptr;
-    for (const auto& h : headers) {
-      header_list = curl_slist_append(header_list, h.c_str());
-    }
-    if (header_list) {
-      curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
-    }
-
-    const CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK) {
-      response.error = curl_easy_strerror(res);
-    }
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status);
-
-    if (header_list) curl_slist_free_all(header_list);
-    curl_easy_cleanup(curl);
+    response = WinHttpGet(url, headers);
     return response;
   }
 
   bool DownloadToFile(const std::string& url,
                       const fs::path& target,
                       std::string& error,
-                      const std::vector<std::string>& headers = {}) const {
+                      const std::vector<std::string>& headers = {},
+                      ProgressFn on_progress = nullptr) const {
     std::error_code ec;
     fs::create_directories(target.parent_path(), ec);
 
-    std::ofstream out(target, std::ios::binary);
+    const fs::path part_file = fs::path(target.string() + ".part");
+    std::ofstream out(part_file, std::ios::binary);
     if (!out) {
       error = "failed to open destination file";
       return false;
     }
 
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-      error = "curl_easy_init failed";
-      return false;
-    }
-
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &HttpClient::WriteFile);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "forge-point/0.1");
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
-
-    struct curl_slist* header_list = nullptr;
-    for (const auto& h : headers) {
-      header_list = curl_slist_append(header_list, h.c_str());
-    }
-    if (header_list) {
-      curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
-    }
-
-    const CURLcode res = curl_easy_perform(curl);
-    long status = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-
-    if (header_list) curl_slist_free_all(header_list);
-    curl_easy_cleanup(curl);
+    bool ok = StreamDownload(url, headers, out, error, std::move(on_progress));
     out.close();
 
-    if (res != CURLE_OK) {
-      error = curl_easy_strerror(res);
-      fs::remove(target, ec);
+    if (!ok) {
+      fs::remove(part_file, ec);
       return false;
     }
-    if (status < 200 || status >= 300) {
-      error = "HTTP " + std::to_string(status);
-      fs::remove(target, ec);
+
+    fs::rename(part_file, target, ec);
+    if (ec) {
+      fs::remove(part_file, ec);
+      error = "failed to rename .part file";
       return false;
     }
     return true;
   }
 
  private:
-  static size_t WriteString(char* ptr, size_t size, size_t nmemb, void* userdata) {
-    auto* out = static_cast<std::string*>(userdata);
-    out->append(ptr, size * nmemb);
-    return size * nmemb;
+#ifdef _WIN32
+  struct WinHttpHandles {
+    HINTERNET session = nullptr;
+    HINTERNET connect = nullptr;
+    HINTERNET request = nullptr;
+
+    ~WinHttpHandles() {
+      if (request) WinHttpCloseHandle(request);
+      if (connect) WinHttpCloseHandle(connect);
+      if (session) WinHttpCloseHandle(session);
+    }
+  };
+
+  static bool WinHttpSetup(const std::string& url,
+                            const std::vector<std::string>& headers,
+                            WinHttpHandles& h,
+                            long& status_code,
+                            std::string& error) {
+    URL_COMPONENTSW urlComp{};
+    urlComp.dwStructSize = sizeof(urlComp);
+    urlComp.dwHostNameLength = 1;
+    urlComp.dwUrlPathLength = 1;
+    urlComp.dwExtraInfoLength = 1;
+
+    std::wstring wide_url(url.begin(), url.end());
+    if (!WinHttpCrackUrl(wide_url.c_str(), static_cast<DWORD>(wide_url.size()), 0, &urlComp)) {
+      error = "WinHttpCrackUrl failed";
+      return false;
+    }
+
+    std::wstring host(urlComp.lpszHostName, urlComp.dwHostNameLength);
+    std::wstring path(urlComp.lpszUrlPath, urlComp.dwUrlPathLength);
+    if (urlComp.lpszExtraInfo && urlComp.dwExtraInfoLength > 0) {
+      path += std::wstring(urlComp.lpszExtraInfo, urlComp.dwExtraInfoLength);
+    }
+
+    h.session = WinHttpOpen(L"forge-point/0.1",
+                             WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                             WINHTTP_NO_PROXY_NAME,
+                             WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!h.session) { error = "WinHttpOpen failed"; return false; }
+
+    h.connect = WinHttpConnect(h.session, host.c_str(), urlComp.nPort, 0);
+    if (!h.connect) { error = "WinHttpConnect failed"; return false; }
+
+    DWORD flags = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+    h.request = WinHttpOpenRequest(h.connect, L"GET", path.c_str(),
+                                   nullptr, WINHTTP_NO_REFERER,
+                                   WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!h.request) { error = "WinHttpOpenRequest failed"; return false; }
+
+    for (const auto& hdr : headers) {
+      std::wstring wh(hdr.begin(), hdr.end());
+      WinHttpAddRequestHeaders(h.request, wh.c_str(),
+                               static_cast<DWORD>(wh.size()),
+                               WINHTTP_ADDREQ_FLAG_ADD);
+    }
+
+    if (!WinHttpSendRequest(h.request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+      error = "WinHttpSendRequest failed";
+      return false;
+    }
+
+    if (!WinHttpReceiveResponse(h.request, nullptr)) {
+      error = "WinHttpReceiveResponse failed";
+      return false;
+    }
+
+    DWORD sc = 0;
+    DWORD sz = sizeof(sc);
+    WinHttpQueryHeaders(h.request,
+                        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX,
+                        &sc, &sz, WINHTTP_NO_HEADER_INDEX);
+    status_code = static_cast<long>(sc);
+    return true;
   }
 
-  static size_t WriteFile(char* ptr, size_t size, size_t nmemb, void* userdata) {
-    auto* out = static_cast<std::ofstream*>(userdata);
-    out->write(ptr, static_cast<std::streamsize>(size * nmemb));
-    return size * nmemb;
+  static uint64_t WinHttpContentLength(HINTERNET hRequest) {
+    wchar_t buf[64] = {};
+    DWORD buf_size = sizeof(buf);
+    if (WinHttpQueryHeaders(hRequest,
+                            WINHTTP_QUERY_CONTENT_LENGTH,
+                            WINHTTP_HEADER_NAME_BY_INDEX,
+                            buf, &buf_size, WINHTTP_NO_HEADER_INDEX)) {
+      try { return std::stoull(std::wstring(buf)); } catch (...) {}
+    }
+    return 0;
   }
+
+  static HttpResponse WinHttpGet(const std::string& url, const std::vector<std::string>& headers) {
+    HttpResponse response;
+    WinHttpHandles h;
+    if (!WinHttpSetup(url, headers, h, response.status, response.error)) {
+      return response;
+    }
+
+    DWORD bytesAvailable = 0;
+    while (WinHttpQueryDataAvailable(h.request, &bytesAvailable) && bytesAvailable > 0) {
+      std::string buffer(bytesAvailable, '\0');
+      DWORD bytesRead = 0;
+      if (WinHttpReadData(h.request, &buffer[0], bytesAvailable, &bytesRead)) {
+        response.body.append(buffer.data(), bytesRead);
+      }
+      bytesAvailable = 0;
+    }
+    return response;
+  }
+
+  static bool StreamDownload(const std::string& url,
+                             const std::vector<std::string>& headers,
+                             std::ostream& out,
+                             std::string& error,
+                             ProgressFn on_progress) {
+    WinHttpHandles h;
+    long status = 0;
+    if (!WinHttpSetup(url, headers, h, status, error)) return false;
+    if (status < 200 || status >= 300) {
+      error = "HTTP " + std::to_string(status);
+      return false;
+    }
+
+    uint64_t total = WinHttpContentLength(h.request);
+    uint64_t downloaded = 0;
+    auto last_report = std::chrono::steady_clock::now();
+
+    DWORD bytesAvailable = 0;
+    while (WinHttpQueryDataAvailable(h.request, &bytesAvailable) && bytesAvailable > 0) {
+      std::string buffer(bytesAvailable, '\0');
+      DWORD bytesRead = 0;
+      if (WinHttpReadData(h.request, &buffer[0], bytesAvailable, &bytesRead)) {
+        out.write(buffer.data(), bytesRead);
+        downloaded += bytesRead;
+
+        auto now = std::chrono::steady_clock::now();
+        if (on_progress && (now - last_report > std::chrono::milliseconds(250) || bytesAvailable == 0)) {
+          on_progress(downloaded, total);
+          last_report = now;
+        }
+      }
+      bytesAvailable = 0;
+    }
+    if (on_progress) on_progress(downloaded, total);
+    return true;
+  }
+
+#else
+  static HttpResponse WinHttpGet(const std::string& url, const std::vector<std::string>& headers) {
+    HttpResponse response;
+    std::string header_args;
+    for (const auto& h : headers) {
+      header_args += " -H " + ShellQuote(h);
+    }
+    std::string cmd = "curl -s -o - -w '\\n%{http_code}'" + header_args + " " + ShellQuote(url);
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) {
+      response.error = "failed to run curl";
+      return response;
+    }
+    std::string all_output;
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), pipe)) {
+      all_output += buf;
+    }
+    int status = pclose(pipe);
+    
+    auto last_nl = all_output.rfind('\n');
+    if (last_nl != std::string::npos) {
+      std::string code_str = Trim(all_output.substr(last_nl + 1));
+      try { response.status = std::stol(code_str); } catch (...) {}
+      response.body = all_output.substr(0, last_nl);
+    } else {
+      response.body = all_output;
+    }
+    return response;
+  }
+
+  static bool StreamDownload(const std::string& url,
+                             const std::vector<std::string>& headers,
+                             std::ostream& out,
+                             std::string& error,
+                             ProgressFn on_progress) {
+    std::string header_args;
+    for (const auto& h : headers) {
+      header_args += " -H " + ShellQuote(h);
+    }
+    std::string cmd = "curl -s -L -o -" + header_args + " " + ShellQuote(url);
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) {
+      error = "failed to run curl";
+      return false;
+    }
+    uint64_t downloaded = 0;
+    auto last_report = std::chrono::steady_clock::now();
+    char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), pipe)) > 0) {
+      out.write(buf, static_cast<std::streamsize>(n));
+      downloaded += n;
+      auto now = std::chrono::steady_clock::now();
+      if (on_progress && (now - last_report > std::chrono::milliseconds(250))) {
+        on_progress(downloaded, 0);
+        last_report = now;
+      }
+    }
+    int status = pclose(pipe);
+    if (on_progress) on_progress(downloaded, 0);
+    if (status != 0) {
+      error = "curl failed with exit code " + std::to_string(status);
+      return false;
+    }
+    return true;
+  }
+#endif
 };
 
 struct HfRepo {
@@ -439,8 +604,8 @@ class HfClient {
     return files;
   }
 
-  bool DownloadFile(const std::string& url, const fs::path& target, std::string& error) {
-    return http_.DownloadToFile(url, target, error, AuthHeaders());
+  bool DownloadFile(const std::string& url, const fs::path& target, std::string& error, ProgressFn on_progress = nullptr) {
+    return http_.DownloadToFile(url, target, error, AuthHeaders(), std::move(on_progress));
   }
 
  private:
@@ -552,6 +717,217 @@ CommandResult RunCommandCapture(const std::vector<std::string>& argv) {
   return {exit_code, output};
 #endif
 }
+
+enum class GpuBackend {
+  None,
+  Cpu,
+  Cuda,
+  Vulkan,
+  Rocm,
+  Sycl,
+  Metal,
+  OpenCL
+};
+
+struct GpuInfo {
+  GpuBackend backend = GpuBackend::None;
+  std::string name;
+  std::string cuda_version;
+};
+
+class GpuDetector {
+ public:
+  static GpuInfo Detect() {
+    GpuInfo info;
+#ifdef _WIN32
+    if (DetectNvidia(info)) return info;
+    if (DetectAmdWindows(info)) return info;
+    info.backend = GpuBackend::Cpu;
+    return info;
+#else
+    if (DetectNvidia(info)) return info;
+    if (DetectRocm(info)) return info;
+    if (DetectMetal(info)) return info;
+    info.backend = GpuBackend::Cpu;
+    return info;
+#endif
+  }
+
+ private:
+  static bool DetectNvidia(GpuInfo& info) {
+    auto probe = RunCommandCapture({"nvidia-smi", "--query-gpu=name", "--format=csv,noheader"});
+    if (probe.exit_code == 0 && !Trim(probe.output).empty()) {
+      info.name = Trim(probe.output);
+      info.backend = GpuBackend::Cuda;
+      auto ver_probe = RunCommandCapture({"nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"});
+      if (ver_probe.exit_code == 0) {
+        std::string ver = Trim(ver_probe.output);
+        if (ver.rfind("13.", 0) == 0) {
+          info.cuda_version = "13.1";
+        } else if (ver.rfind("12.", 0) == 0) {
+          info.cuda_version = "12.4";
+        }
+      }
+      return true;
+    }
+    return false;
+  }
+
+  static bool DetectAmdWindows(GpuInfo& info) {
+    auto probe = RunCommandCapture({"wmic", "path", "win32_VideoController", "get", "name", "/format:csv"});
+    if (probe.exit_code == 0 && probe.output.find("Radeon") != std::string::npos) {
+      info.name = "AMD GPU";
+      info.backend = GpuBackend::Vulkan;
+      return true;
+    }
+    return false;
+  }
+
+  static bool DetectRocm(GpuInfo& info) {
+    auto probe = RunCommandCapture({"rocm-smi", "--showproductname"});
+    if (probe.exit_code == 0 && !Trim(probe.output).empty()) {
+      info.name = Trim(probe.output);
+      info.backend = GpuBackend::Rocm;
+      return true;
+    }
+    return false;
+  }
+
+  static bool DetectMetal(GpuInfo& info) {
+    auto probe = RunCommandCapture({"system_profiler", "SPDisplaysDataType"});
+    if (probe.exit_code == 0 && probe.output.find("Apple") != std::string::npos) {
+      info.name = "Apple Silicon";
+      info.backend = GpuBackend::Metal;
+      return true;
+    }
+    return false;
+  }
+};
+
+struct LlamaRelease {
+  std::string tag;
+  std::vector<std::string> assets;
+};
+
+class LlamaDownloader {
+ public:
+  explicit LlamaDownloader(HttpClient& http) : http_(http) {}
+
+  std::optional<LlamaRelease> GetLatestRelease(std::string& error) const {
+    auto resp = http_.Get("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest");
+    if (!resp.error.empty()) {
+      error = resp.error;
+      return std::nullopt;
+    }
+    if (resp.status != 200) {
+      error = "HTTP " + std::to_string(resp.status);
+      return std::nullopt;
+    }
+    auto payload = json::parse(resp.body, nullptr, false);
+    if (payload.is_discarded() || !payload.is_object()) {
+      error = "invalid JSON";
+      return std::nullopt;
+    }
+    LlamaRelease release;
+    release.tag = payload.value("tag_name", "");
+    for (const auto& asset : payload.value("assets", json::array())) {
+      release.assets.push_back(asset.value("name", ""));
+    }
+    return release;
+  }
+
+  std::optional<std::string> FindAssetForPlatform(const LlamaRelease& release, const GpuInfo& gpu) const {
+    std::vector<std::string> candidates;
+#ifdef _WIN32
+    if (gpu.backend == GpuBackend::Cuda) {
+      std::string cuda = gpu.cuda_version.empty() ? "12.4" : gpu.cuda_version;
+      candidates = {
+          "llama-" + release.tag.substr(1) + "-bin-win-cuda-" + cuda + "-x64.zip",
+          "llama-b8565-bin-win-cuda-" + cuda + "-x64.zip"};
+    } else if (gpu.backend == GpuBackend::Vulkan || gpu.backend == GpuBackend::None) {
+      candidates = {"llama-" + release.tag.substr(1) + "-bin-win-vulkan-x64.zip",
+                    "llama-b8565-bin-win-vulkan-x64.zip"};
+    } else if (gpu.backend == GpuBackend::Cpu) {
+      candidates = {"llama-" + release.tag.substr(1) + "-bin-win-cpu-x64.zip",
+                    "llama-b8565-bin-win-cpu-x64.zip"};
+    } else if (gpu.backend == GpuBackend::Sycl) {
+      candidates = {"llama-" + release.tag.substr(1) + "-bin-win-sycl-x64.zip",
+                    "llama-b8565-bin-win-sycl-x64.zip"};
+    }
+#else
+    auto sys_probe = RunCommandCapture({"uname", "-m"});
+    bool is_arm = sys_probe.exit_code == 0 && Trim(sys_probe.output).find("arm") != std::string::npos;
+    if (is_arm) {
+      candidates = {"llama-" + release.tag.substr(1) + "-bin-macos-arm64.tar.gz",
+                    "llama-b8565-bin-macos-arm64.tar.gz"};
+    } else if (gpu.backend == GpuBackend::Metal) {
+      candidates = {"llama-" + release.tag.substr(1) + "-bin-macos-arm64.tar.gz",
+                    "llama-b8565-bin-macos-arm64.tar.gz"};
+    } else if (gpu.backend == GpuBackend::Cuda) {
+      candidates = {"llama-" + release.tag.substr(1) + "-bin-ubuntu-x64.tar.gz",
+                    "llama-b8565-bin-ubuntu-x64.tar.gz"};
+    } else if (gpu.backend == GpuBackend::Vulkan) {
+      candidates = {"llama-" + release.tag.substr(1) + "-bin-ubuntu-vulkan-x64.tar.gz",
+                    "llama-b8565-bin-ubuntu-vulkan-x64.tar.gz"};
+    } else if (gpu.backend == GpuBackend::Rocm) {
+      candidates = {"llama-" + release.tag.substr(1) + "-bin-ubuntu-rocm-7.2-x64.tar.gz",
+                    "llama-b8565-bin-ubuntu-rocm-7.2-x64.tar.gz"};
+    } else {
+      candidates = {"llama-" + release.tag.substr(1) + "-bin-ubuntu-x64.tar.gz",
+                    "llama-b8565-bin-ubuntu-x64.tar.gz"};
+    }
+#endif
+    if (candidates.empty()) {
+      candidates = {"llama-" + release.tag.substr(1) + "-bin-win-cpu-x64.zip",
+                    "llama-b8565-bin-win-cpu-x64.zip"};
+    }
+    for (const auto& candidate : candidates) {
+      for (const auto& asset : release.assets) {
+        if (asset == candidate) {
+          return candidate;
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::string GetDownloadUrl(const std::string& tag, const std::string& asset) const {
+    return "https://github.com/ggml-org/llama.cpp/releases/download/" + tag + "/" + asset;
+  }
+
+  bool DownloadAndExtract(const std::string& url,
+                          const fs::path& target_dir,
+                          std::string& error,
+                          const std::function<void(std::string)>& progress,
+                          ProgressFn on_dl_progress = nullptr) {
+    fs::path temp = fs::temp_directory_path() / "llama-download";
+    std::error_code ec;
+    fs::remove_all(temp, ec);
+    fs::create_directories(temp, ec);
+    fs::path archive = temp / "llama.zip";
+    progress("Downloading...");
+    if (!http_.DownloadToFile(url, archive, error, {}, std::move(on_dl_progress))) {
+      return false;
+    }
+    progress("Extracting...");
+    fs::create_directories(target_dir, ec);
+#ifdef _WIN32
+    std::string cmd = "powershell -Command \"Expand-Archive -Path '" + archive.string() + "' -DestinationPath '" + target_dir.string() + "' -Force\"";
+#else
+    std::string cmd = "tar -xzf " + ShellQuote(archive.string()) + " -C " + ShellQuote(target_dir.string());
+#endif
+    int result = system(cmd.c_str());
+    if (result != 0) {
+      error = "extraction failed";
+      return false;
+    }
+    progress("Done!");
+    return true;
+  }
+
+ private:
+  HttpClient& http_;
+};
 
 class ProcessSupervisor {
  public:
@@ -820,12 +1196,13 @@ struct SlashCommand {
 class App {
  public:
   App()
-      : screen_(ScreenInteractive::Fullscreen()),
+      : screen_(ScreenInteractive::FullscreenAlternateScreen()),
         project_models_dir_(fs::current_path() / "models"),
         runtime_dir_(fs::current_path() / "runtime" / "llama.cpp"),
         scanner_(project_models_dir_),
         hf_client_(http_client_),
         server_manager_(process_, http_client_),
+        downloader_(http_client_),
         source_toggle_entries_({"Local GGUF", "HF Repo/File"}),
         slash_commands_({
             {"/help", "/help", "Show available slash commands."},
@@ -837,6 +1214,7 @@ class App {
             {"/health", "/health", "Check the /health endpoint."},
             {"/rescan", "/rescan", "Rescan local GGUFs and cache."},
             {"/refresh-binary", "/refresh-binary", "Rescan runtime/llama.cpp for llama-server."},
+            {"/download-binary", "/download-binary", "Download llama.cpp for your GPU."},
             {"/yolo", "/yolo [on|off|toggle]", "Toggle confirmation-free mode."},
             {"/welcome", "/welcome", "Show the splash screen again."},
             {"/focus", "/focus <search|models|server|command>", "Move focus to a specific control."},
@@ -864,6 +1242,37 @@ class App {
   void Run() { screen_.Loop(root_); }
 
  private:
+  void PostToUi(std::function<void()> fn) {
+    {
+      std::lock_guard<std::mutex> lock(ui_queue_mutex_);
+      ui_queue_.push_back(std::move(fn));
+    }
+    screen_.PostEvent(Event::Custom);
+  }
+
+  void DrainUiQueue() {
+    std::deque<std::function<void()>> batch;
+    {
+      std::lock_guard<std::mutex> lock(ui_queue_mutex_);
+      batch.swap(ui_queue_);
+    }
+    for (auto& fn : batch) {
+      fn();
+    }
+  }
+
+  void CleanupFinishedWorkers() {
+    workers_.erase(
+        std::remove_if(workers_.begin(), workers_.end(),
+                       [](const std::jthread& t) { return !t.joinable(); }),
+        workers_.end());
+  }
+
+  void SpawnWorker(std::function<void()> fn) {
+    CleanupFinishedWorkers();
+    workers_.emplace_back([f = std::move(fn)] { f(); });
+  }
+
   void AddLog(const std::string& line) {
     std::lock_guard<std::mutex> lock(log_mutex_);
     std::istringstream iss(line);
@@ -875,6 +1284,38 @@ class App {
       logs_.erase(logs_.begin());
     }
     screen_.PostEvent(Event::Custom);
+  }
+
+  size_t AddTransfer(const std::string& label) {
+    std::lock_guard<std::mutex> lock(transfers_mutex_);
+    transfers_.push_back({label, 0, 0, false, false});
+    return transfers_.size() - 1;
+  }
+
+  void UpdateTransfer(size_t idx, uint64_t downloaded, uint64_t total) {
+    std::lock_guard<std::mutex> lock(transfers_mutex_);
+    if (idx < transfers_.size()) {
+      transfers_[idx].downloaded = downloaded;
+      transfers_[idx].total = total;
+    }
+    screen_.PostEvent(Event::Custom);
+  }
+
+  void FinishTransfer(size_t idx, bool failed = false) {
+    std::lock_guard<std::mutex> lock(transfers_mutex_);
+    if (idx < transfers_.size()) {
+      transfers_[idx].done = true;
+      transfers_[idx].failed = failed;
+    }
+    screen_.PostEvent(Event::Custom);
+  }
+
+  void CleanupDoneTransfers() {
+    std::lock_guard<std::mutex> lock(transfers_mutex_);
+    transfers_.erase(
+        std::remove_if(transfers_.begin(), transfers_.end(),
+                       [](const Transfer& t) { return t.done; }),
+        transfers_.end());
   }
 
   void ShowWelcome() {
@@ -895,11 +1336,46 @@ class App {
   }
 
   void RefreshBinaryStatus() {
+    gpu_info_ = GpuDetector::Detect();
     binary_path_ = LlamaServerManager::FindBundledBinary(runtime_dir_);
     if (binary_path_) {
       binary_status_ = "llama-server: " + binary_path_->string();
     } else {
-      binary_status_ = "No llama-server found in runtime/llama.cpp/ or PATH.";
+      std::string gpu_name = gpu_info_.name.empty() ? "CPU" : gpu_info_.name;
+      binary_status_ = "No llama-server. GPU: " + gpu_name;
+    }
+  }
+
+  void DownloadLlamaCpp() {
+    std::string error;
+    AddLog("Fetching latest llama.cpp release...");
+    auto release = downloader_.GetLatestRelease(error);
+    if (!release) {
+      AddLog("Failed to fetch release: " + error);
+      return;
+    }
+    AddLog("Release: " + release->tag);
+    auto asset = downloader_.FindAssetForPlatform(*release, gpu_info_);
+    if (!asset) {
+      AddLog("No compatible binary found for this platform.");
+      return;
+    }
+    AddLog("Downloading: " + *asset);
+    auto url = downloader_.GetDownloadUrl(release->tag, *asset);
+    size_t tid = AddTransfer("llama.cpp: " + *asset);
+    auto dl_progress = [this, tid](uint64_t dl, uint64_t total) {
+      UpdateTransfer(tid, dl, total);
+    };
+    bool ok = downloader_.DownloadAndExtract(url, runtime_dir_, error, [this](const std::string& msg) {
+      AddLog(msg);
+    }, dl_progress);
+    if (ok) {
+      FinishTransfer(tid);
+      AddLog("Download complete!");
+      PostToUi([this] { RefreshBinaryStatus(); });
+    } else {
+      FinishTransfer(tid, true);
+      AddLog("Download failed: " + error);
     }
   }
 
@@ -986,12 +1462,18 @@ class App {
                   true,
                   [this, repo, file, target_file] {
                     AddLog("Downloading " + file.filename + "...");
-                    workers_.emplace_back([this, url = file.download_url, target_file] {
+                    size_t tid = AddTransfer(file.filename);
+                    SpawnWorker([this, url = file.download_url, target_file, tid] {
                       std::string error;
-                      if (hf_client_.DownloadFile(url, target_file, error)) {
+                      auto progress = [this, tid](uint64_t dl, uint64_t total) {
+                        UpdateTransfer(tid, dl, total);
+                      };
+                      if (hf_client_.DownloadFile(url, target_file, error, progress)) {
+                        FinishTransfer(tid);
                         AddLog("Download finished: " + target_file.string());
-                        RefreshLocalModels();
+                        PostToUi([this] { RefreshLocalModels(); });
                       } else {
+                        FinishTransfer(tid, true);
                         AddLog("Download failed: " + error);
                       }
                     });
@@ -1108,6 +1590,24 @@ class App {
     AddLog("Action cancelled.");
   }
 
+  enum class Panel { Local = 0, Hub, Server, Command, COUNT };
+
+  void CyclePanel(int delta) {
+    const int count = static_cast<int>(Panel::COUNT);
+    active_panel_ = static_cast<Panel>((static_cast<int>(active_panel_) + delta + count) % count);
+    FocusActivePanel();
+  }
+
+  void FocusActivePanel() {
+    switch (active_panel_) {
+      case Panel::Local:   local_menu_->TakeFocus(); break;
+      case Panel::Hub:     search_input_->TakeFocus(); break;
+      case Panel::Server:  host_input_component_->TakeFocus(); break;
+      case Panel::Command: command_input_component_->TakeFocus(); break;
+      default: break;
+    }
+  }
+
   void BuildUi() {
     search_input_ = Input(&search_query_, "Qwen GGUF / org/model");
     host_input_component_ = Input(&host_input_, "127.0.0.1");
@@ -1115,41 +1615,24 @@ class App {
     extra_args_component_ = Input(&extra_args_input_, "-c 4096");
     command_input_component_ = Input(&command_input_, "/help, /search, /start...");
 
-    search_button_ = Button("Search repos", [this] { SearchRepos(); });
-    list_files_button_ = Button("List GGUFs", [this] { LoadRepoFiles(); });
-    download_button_ = Button("Download GGUF", [this] { DownloadSelectedFile(); });
-    rescan_button_ = Button("Rescan", [this] { RefreshLocalModels(); });
-    refresh_binary_button_ = Button("Refresh binary", [this] { RefreshBinaryStatus(); });
-    start_button_ = Button("Start server", [this] { StartServer(); });
-    stop_button_ = Button("Stop server", [this] { StopServer(); });
-    health_button_ = Button("Check /health", [this] { CheckHealth(); });
-
     local_menu_ = Menu(&local_model_entries_, &local_selected_);
     repo_menu_ = Menu(&repo_entries_, &repo_selected_);
     file_menu_ = Menu(&file_entries_, &file_selected_);
     source_toggle_ = Toggle(&source_toggle_entries_, &source_mode_);
 
+    auto local_panel = Container::Vertical({local_menu_, source_toggle_});
+    auto hub_panel = Container::Vertical({search_input_, repo_menu_, file_menu_});
+    auto server_panel = Container::Vertical({host_input_component_, port_input_component_, extra_args_component_});
+
     root_container_ = Container::Vertical({
-        search_input_,
-        search_button_,
-        list_files_button_,
-        download_button_,
-        rescan_button_,
-        refresh_binary_button_,
-        local_menu_,
-        repo_menu_,
-        file_menu_,
-        source_toggle_,
-        host_input_component_,
-        port_input_component_,
-        extra_args_component_,
-        start_button_,
-        stop_button_,
-        health_button_,
+        local_panel,
+        hub_panel,
+        server_panel,
         command_input_component_,
     });
 
     root_ = Renderer(root_container_, [this] {
+      DrainUiQueue();
       Element body = show_welcome_ ? BuildWelcomeScreen() : BuildMainScreen();
       if (show_confirm_) {
         body = dbox({body, BuildConfirmOverlay()});
@@ -1161,8 +1644,11 @@ class App {
       if (show_welcome_) {
         if (event == Event::Return || event == Event::Escape || event == Event::Character(' ')) {
           HideWelcome();
+          active_panel_ = Panel::Command;
+          FocusActivePanel();
           return true;
         }
+        return true;
       }
 
       if (show_confirm_) {
@@ -1174,23 +1660,78 @@ class App {
           CancelAction();
           return true;
         }
+        return true;
+      }
+
+      if (event == Event::Tab) {
+        if (command_input_component_->Focused() && !command_input_.empty() && command_input_.front() == '/') {
+          AcceptSuggestion();
+          return true;
+        }
+        CyclePanel(1);
+        return true;
       }
 
       if (event == Event::TabReverse) {
+        CyclePanel(-1);
+        return true;
+      }
+
+      // Ctrl+Y toggles YOLO
+      if (event == Event::Special({25})) {
         ToggleYolo();
         return true;
       }
 
       if (event == Event::Character('q') || event == Event::CtrlC) {
+        if (command_input_component_->Focused() || search_input_->Focused() ||
+            host_input_component_->Focused() || port_input_component_->Focused() ||
+            extra_args_component_->Focused()) {
+          if (event == Event::Character('q')) return false;
+        }
         screen_.ExitLoopClosure()();
         return true;
       }
 
-      if (!show_welcome_ && !show_confirm_ && event == Event::Character('/')) {
+      if (event == Event::Character('/')) {
         OpenCommandPalette();
         return true;
       }
 
+      if (event == Event::Escape) {
+        active_panel_ = Panel::Command;
+        FocusActivePanel();
+        return true;
+      }
+
+      // Context-sensitive Enter
+      if (event == Event::Return) {
+        if (command_input_component_->Focused()) {
+          ExecuteCommandInput();
+          return true;
+        }
+        if (search_input_->Focused()) {
+          SearchRepos();
+          return true;
+        }
+        if (repo_menu_->Focused()) {
+          LoadRepoFiles();
+          return true;
+        }
+        if (file_menu_->Focused()) {
+          DownloadSelectedFile();
+          return true;
+        }
+        if (local_menu_->Focused()) {
+          if (!local_models_.empty() && local_selected_ >= 0 && local_selected_ < static_cast<int>(local_models_.size())) {
+            source_mode_ = 0;
+            AddLog("Selected: " + local_models_[local_selected_].name);
+          }
+          return true;
+        }
+      }
+
+      // Arrow navigation within command palette
       if (command_input_component_->Focused()) {
         if (event == Event::ArrowDown) {
           MoveSuggestion(1);
@@ -1200,24 +1741,8 @@ class App {
           MoveSuggestion(-1);
           return true;
         }
-        if (event == Event::Tab) {
-          AcceptSuggestion();
-          return true;
-        }
-        if (event == Event::Return) {
-          ExecuteCommandInput();
-          return true;
-        }
       }
 
-      return false;
-    });
-
-    search_input_ = CatchEvent(search_input_, [this](Event event) {
-      if (event == Event::Return) {
-        SearchRepos();
-        return true;
-      }
       return false;
     });
 
@@ -1336,6 +1861,15 @@ class App {
       AddLog(binary_status_);
       return;
     }
+    if (cmd == "/download-binary") {
+      if (binary_path_) {
+        AddLog("llama-server already present. Use /refresh-binary to rescan.");
+      } else {
+        AddLog("Starting download in background...");
+        SpawnWorker([this] { DownloadLlamaCpp(); });
+      }
+      return;
+    }
     if (cmd == "/welcome") {
       ShowWelcome();
       return;
@@ -1355,10 +1889,16 @@ class App {
     }
     if (cmd == "/focus") {
       const std::string target = ToLower(arg(1));
-      if (target == "search") search_input_->TakeFocus();
-      else if (target == "models") local_menu_->TakeFocus();
-      else if (target == "server") host_input_component_->TakeFocus();
-      else command_input_component_->TakeFocus();
+      if (target == "search" || target == "hub") {
+        active_panel_ = Panel::Hub;
+      } else if (target == "models" || target == "local") {
+        active_panel_ = Panel::Local;
+      } else if (target == "server") {
+        active_panel_ = Panel::Server;
+      } else {
+        active_panel_ = Panel::Command;
+      }
+      FocusActivePanel();
       AddLog("Focus moved to " + (target.empty() ? std::string("command") : target) + ".");
       return;
     }
@@ -1381,18 +1921,57 @@ class App {
       if (i + 1 < logs_copy.size()) log_stream << '\n';
     }
 
-    return vbox({
-               BuildHeader(),
-               separator(),
-               hbox({BuildLocalPanel() | flex, BuildHubPanel() | flex, BuildServerPanel() | flex}),
-               separator(),
-               window(text("Logs"), paragraph(log_stream.str().empty() ? "(no logs yet)" : log_stream.str()) | frame | size(HEIGHT, GREATER_THAN, 12)),
-               separator(),
-               BuildCommandPalette(),
-               separator(),
-               text("q quit · / open command palette · Shift+Tab toggle YOLO") | dim,
-           }) |
-           border;
+    Elements layout;
+    layout.push_back(BuildHeader());
+    layout.push_back(separator());
+    layout.push_back(hbox({BuildLocalPanel() | flex, BuildHubPanel() | flex, BuildServerPanel() | flex}));
+    layout.push_back(separator());
+
+    auto transfers_el = BuildTransfers();
+    if (transfers_el) {
+      layout.push_back(*transfers_el);
+      layout.push_back(separator());
+    }
+
+    layout.push_back(window(text("Logs"), paragraph(log_stream.str().empty() ? "(no logs yet)" : log_stream.str()) | frame | size(HEIGHT, GREATER_THAN, 12)));
+    layout.push_back(separator());
+    layout.push_back(BuildCommandPalette());
+    layout.push_back(separator());
+    layout.push_back(text("q quit · / commands · Tab cycle panels · Esc focus command · Ctrl+Y yolo · Enter act") | dim);
+
+    return vbox(std::move(layout)) | border;
+  }
+
+  std::optional<Element> BuildTransfers() {
+    std::lock_guard<std::mutex> lock(transfers_mutex_);
+    std::vector<Transfer> active;
+    for (const auto& t : transfers_) {
+      if (!t.done) active.push_back(t);
+    }
+    if (active.empty()) return std::nullopt;
+
+    Elements rows;
+    for (const auto& t : active) {
+      std::string status_text;
+      if (t.total > 0) {
+        double pct = static_cast<double>(t.downloaded) / static_cast<double>(t.total);
+        status_text = HumanBytes(t.downloaded) + " / " + HumanBytes(t.total) +
+                      " (" + std::to_string(static_cast<int>(pct * 100.0)) + "%)";
+        rows.push_back(hbox({
+            text(t.label + " ") | bold,
+            gauge(static_cast<float>(pct)) | flex,
+            text(" " + status_text),
+        }));
+      } else {
+        status_text = HumanBytes(t.downloaded) + " downloaded...";
+        rows.push_back(hbox({
+            text(t.label + " ") | bold,
+            spinner(4, static_cast<int>(t.downloaded / 65536) % 4),
+            text(" " + status_text) | dim,
+        }));
+      }
+    }
+    return window(text("Transfers"), vbox(std::move(rows)));
   }
 
   Element BuildHeader() const {
@@ -1422,7 +2001,10 @@ class App {
       details = m.path.string() + "\norigin: " + m.origin + "\nsize: " + HumanBytes(m.size);
     }
 
-    return window(text("Local GGUFs"),
+    bool active = (active_panel_ == Panel::Local);
+    Element title = active ? (text("▸ Local GGUFs") | color(Color::CyanLight)) : text("Local GGUFs");
+
+    return window(title,
                   vbox({
                       hbox({text("HF cache: "), text(scanner_.CacheRoot().string()) | dim}) | flex,
                       separator(),
@@ -1430,7 +2012,7 @@ class App {
                       separator(),
                       paragraph(details),
                       separator(),
-                      hbox({rescan_button_->Render(), filler(), refresh_binary_button_->Render()}),
+                      text("/rescan · /download-binary · Enter select") | dim,
                   }));
   }
 
@@ -1449,22 +2031,24 @@ class App {
       file_detail = file.filename + "\nsize: " + HumanBytes(file.size) + "\n" + file.download_url;
     }
 
-    return window(text("Hugging Face"),
+    bool active = (active_panel_ == Panel::Hub);
+    Element title = active ? (text("▸ Hugging Face") | color(Color::CyanLight)) : text("Hugging Face");
+
+    return window(title,
                   vbox({
                       search_input_->Render(),
-                      hbox({search_button_->Render(), filler(), list_files_button_->Render()}),
                       separator(),
-                      text("Repos") | bold,
+                      text("Repos (Enter → list files)") | bold,
                       repo_menu_->Render() | frame | size(HEIGHT, LESS_THAN, 8),
                       separator(),
                       paragraph(repo_detail),
                       separator(),
-                      text("GGUF files") | bold,
+                      text("GGUF files (Enter → download)") | bold,
                       file_menu_->Render() | frame | size(HEIGHT, LESS_THAN, 8),
                       separator(),
                       paragraph(file_detail),
                       separator(),
-                      download_button_->Render(),
+                      text("/search · /files · /download") | dim,
                   }));
   }
 
@@ -1479,7 +2063,10 @@ class App {
       target += "\nrepo: " + hf_repos_[repo_selected_].id + "\nfile: " + repo_files_[file_selected_].filename;
     }
 
-    return window(text("Server"),
+    bool active = (active_panel_ == Panel::Server);
+    Element title = active ? (text("▸ Server") | color(Color::CyanLight)) : text("Server");
+
+    return window(title,
                   vbox({
                       text(binary_status_),
                       separator(),
@@ -1492,10 +2079,9 @@ class App {
                       text("Port"), port_input_component_->Render(),
                       text("Extra args"), extra_args_component_->Render(),
                       separator(),
-                      hbox({start_button_->Render(), filler(), stop_button_->Render()}),
-                      health_button_->Render(),
-                      separator(),
                       text("Health: " + health_status_),
+                      separator(),
+                      text("/start · /stop · /health") | dim,
                   }));
   }
 
@@ -1559,11 +2145,11 @@ class App {
                text("Forge-Point") | bold | center | color(Color::White),
                text("A terminal cockpit for GGUF discovery, download, and llama.cpp server control.") | center | dim,
                separator(),
-               paragraphAlignCenter("Press Enter to enter the cockpit. Press Shift+Tab any time to toggle YOLO mode.") |
+               paragraphAlignCenter("Press Enter to enter the cockpit.") |
                    size(WIDTH, LESS_THAN, 80),
                separator(),
-               text("/ opens the slash command palette") | center | color(Color::CyanLight),
-               text("runtime/llama.cpp/ is where your prebuilt llama.cpp release lives") | center | dim,
+               text("/ opens the command palette · Tab cycles panels · Enter acts") | center | color(Color::CyanLight),
+               text("Ctrl+Y toggles YOLO mode · Esc returns to command palette") | center | dim,
                filler(),
            }) |
            border;
@@ -1578,6 +2164,8 @@ class App {
   HfClient hf_client_;
   ProcessSupervisor process_;
   LlamaServerManager server_manager_;
+  LlamaDownloader downloader_;
+  GpuInfo gpu_info_;
 
   std::optional<fs::path> binary_path_;
   std::string binary_status_ = "unknown";
@@ -1617,6 +2205,8 @@ class App {
   int source_mode_ = 0;
   int command_selected_ = 0;
 
+  Panel active_panel_ = Panel::Command;
+
   Component root_container_;
   Component root_;
   Component search_input_;
@@ -1624,14 +2214,6 @@ class App {
   Component port_input_component_;
   Component extra_args_component_;
   Component command_input_component_;
-  Component search_button_;
-  Component list_files_button_;
-  Component download_button_;
-  Component rescan_button_;
-  Component refresh_binary_button_;
-  Component start_button_;
-  Component stop_button_;
-  Component health_button_;
   Component local_menu_;
   Component repo_menu_;
   Component file_menu_;
@@ -1639,6 +2221,20 @@ class App {
 
   mutable std::mutex log_mutex_;
   std::vector<std::string> logs_;
+
+  std::mutex ui_queue_mutex_;
+  std::deque<std::function<void()>> ui_queue_;
+
+  struct Transfer {
+    std::string label;
+    uint64_t downloaded = 0;
+    uint64_t total = 0;
+    bool done = false;
+    bool failed = false;
+  };
+
+  mutable std::mutex transfers_mutex_;
+  std::vector<Transfer> transfers_;
 };
 
 }  // namespace

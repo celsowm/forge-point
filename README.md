@@ -77,10 +77,12 @@ On Windows, depending on the generator:
 
 ## Key bindings
 
-- `Enter`: dismiss welcome screen / confirm actions / run a slash command
+- `Enter`: context-sensitive action (search → search repos, repo list → list files, file list → download, command palette → run command)
 - `/`: focus the slash command palette
-- `Tab`: autocomplete the selected slash command
-- `Shift+Tab`: toggle YOLO mode
+- `Tab`: cycle between panels (Local → Hub → Server → Command), or autocomplete in command palette
+- `Shift+Tab`: cycle panels in reverse
+- `Ctrl+Y`: toggle YOLO mode
+- `Esc`: return focus to command palette
 - `Arrow Up / Arrow Down`: move through slash command suggestions
 - `q` or `Ctrl+C`: quit
 
