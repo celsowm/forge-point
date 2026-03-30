@@ -7,6 +7,8 @@
 #include "app/confirmation_guard.hpp"
 #include "app/logger.hpp"
 #include "app/transfer_tracker.hpp"
+#include "app/debug_overlay.hpp"
+#include "ui/home_menu.hpp"
 #include "core/gpu_detector.hpp"
 #include "core/http_client.hpp"
 #include "core/llama_downloader.hpp"
@@ -34,6 +36,8 @@ namespace forge {
 
 class App {
  public:
+  enum class MenuState { Home = 0, Search, Files, DownloadBinary, Server, Models };
+
   App();
   void Run();
 
@@ -54,12 +58,12 @@ class App {
   void CheckHealth();
 
   std::string DescribeServerLaunch() const;
-  void ShowWelcome();
-  void HideWelcome();
-  void SwitchView(std::string_view name);
-  void FocusActiveView();
 
   void BuildUi();
+  void NavigateTo(MenuState state);
+  void GoBack();
+  void HandleEnterKey();
+  void HandleArrowKeys(Event event);
   void MoveSuggestion(int delta);
   void AcceptSuggestion();
   void UpdateCommandSuggestions();
@@ -67,13 +71,16 @@ class App {
 
   Element BuildMainScreen();
   Element BuildStatusBar() const;
-  Element BuildVibecodeView() const;
+  Element BuildSearchView();
+  Element BuildFilesView();
+  Element BuildDownloadBinaryView();
+  Element BuildServerView();
   Element BuildModelsView();
-  Element BuildHubView();
   Element BuildCommandInput();
   std::optional<Element> BuildTransfers();
   Element BuildConfirmOverlay() const;
-  Element BuildWelcomeScreen() const;
+  Element BuildVibecodeView() const;
+  Element BuildHubView();
 
   void RegisterCommands();
 
@@ -106,8 +113,6 @@ class App {
   std::string last_command_preview_;
   std::string active_repo_sha_;
 
-  bool show_welcome_ = true;
-
   std::string search_query_;
   std::string command_input_;
 
@@ -129,8 +134,17 @@ class App {
   int repo_selected_ = 0;
   int file_selected_ = 0;
   int command_selected_ = 0;
+  int home_selected_ = 0;
+  int server_selected_ = 0;
   bool hub_focus_on_files_ = false;
 
+  std::vector<ui::MenuItem> home_items_;
+  std::vector<ui::MenuItem> server_items_;
+  std::vector<ui::MenuItem> model_items_;
+
+  MenuState current_state_ = MenuState::Home;
+  MenuState previous_state_ = MenuState::Home;
+  
   enum class View { Vibecode = 0, Models, Hub };
   View active_view_ = View::Vibecode;
 

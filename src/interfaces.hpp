@@ -47,6 +47,9 @@ struct GpuInfo {
   GpuBackend backend = GpuBackend::None;
   std::string name;
   std::string cuda_version;
+  std::string driver_version;
+  uint64_t vram_bytes = 0;
+  uint32_t vendor_id = 0;
 };
 
 struct LlamaRelease {
