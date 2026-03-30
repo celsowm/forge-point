@@ -56,6 +56,7 @@ class App {
   void StartServer();
   void StopServer();
   void CheckHealth();
+  void QuitApp();
 
   std::string DescribeServerLaunch() const;
 

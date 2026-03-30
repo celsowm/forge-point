@@ -39,175 +39,135 @@ std::optional<LlamaRelease> LlamaDownloader::GetLatestRelease(std::string& error
   return release;
 }
 
-std::optional<std::string> LlamaDownloader::FindAssetForPlatform(
-    const LlamaRelease& release, const GpuInfo& gpu) const {
-  std::vector<std::string> candidates;
-  
-  // Debug logging
-  auto& debug = DebugOverlay::Instance();
-  debug.Debug("FindAssetForPlatform called. Backend: " + std::to_string(static_cast<int>(gpu.backend)) + 
-              ", Name: " + gpu.name, "Downloader");
-  
+// Build a set of candidate asset names for the current platform + GPU backend.
+// Actual naming convention from llama.cpp releases:
+//   Windows:  llama-{tag}-bin-win-{variant}-{arch}.zip
+//   macOS:    llama-{tag}-bin-macos-{arch}.tar.gz
+//   Linux:    llama-{tag}-bin-ubuntu-{variant}-{arch}.tar.gz
+//   CUDA DLLs (Windows only): cudart-llama-bin-win-cuda-{ver}-x64.zip
+std::vector<std::string> LlamaDownloader::BuildCandidates(
+    const std::string& tag, const GpuInfo& gpu) const {
+  std::vector<std::string> c;
+
 #ifdef _WIN32
-  // Windows binaries
-  if (gpu.backend == GpuBackend::Cuda) {
-    debug.Debug("CUDA backend detected, using CUDA 12.4 (pre-compiled binary)", "Downloader");
-    // For pre-compiled binaries, always use CUDA 12.4 (most stable)
-    // The CUDA runtime is included in the llama.cpp release
-    std::string cuda = "12.4";
-    candidates = {
-        "llama-" + release.tag.substr(1) + "-bin-win-cuda-" + cuda + "-x64.zip",
-        "llama-b8580-bin-win-cuda-" + cuda + "-x64.zip",
-        "llama-b8565-bin-win-cuda-" + cuda + "-x64.zip"};
-    debug.Debug("Generated CUDA candidates: " + candidates[0] + ", " + candidates[1], "Downloader");
-  } else if (gpu.backend == GpuBackend::Vulkan || gpu.backend == GpuBackend::None) {
-    debug.Debug("Vulkan/None backend detected", "Downloader");
-    candidates = {"llama-" + release.tag.substr(1) + "-bin-win-vulkan-x64.zip",
-                  "llama-b8580-bin-win-vulkan-x64.zip",
-                  "llama-b8565-bin-win-vulkan-x64.zip"};
-  } else if (gpu.backend == GpuBackend::Cpu) {
-    debug.Debug("CPU backend detected", "Downloader");
-    candidates = {"llama-" + release.tag.substr(1) + "-bin-win-cpu-x64.zip",
-                  "llama-b8580-bin-win-cpu-x64.zip",
-                  "llama-b8565-bin-win-cpu-x64.zip"};
-  } else if (gpu.backend == GpuBackend::Sycl) {
-    debug.Debug("SYCL backend detected", "Downloader");
-    candidates = {"llama-" + release.tag.substr(1) + "-bin-win-sycl-x64.zip",
-                  "llama-b8580-bin-win-sycl-x64.zip",
-                  "llama-b8565-bin-win-sycl-x64.zip"};
-  } else if (gpu.backend == GpuBackend::Rocm) {
-    debug.Debug("ROCm backend detected", "Downloader");
-    candidates = {"llama-" + release.tag.substr(1) + "-bin-win-hip-radeon-x64.zip",
-                  "llama-b8580-bin-win-hip-radeon-x64.zip",
-                  "llama-b8565-bin-win-hip-radeon-x64.zip"};
-  } else {
-    debug.Debug("Unknown backend: " + std::to_string(static_cast<int>(gpu.backend)), "Downloader");
-  }
-  
-  debug.Debug("Total candidates: " + std::to_string(candidates.size()), "Downloader");
-  for (size_t i = 0; i < candidates.size() && i < 3; ++i) {
-    debug.Debug("  Candidate " + std::to_string(i) + ": " + candidates[i], "Downloader");
-  }
-  
-#elif defined(__APPLE__)
-  // macOS binaries
-  if (gpu.backend == GpuBackend::Metal || gpu.backend == GpuBackend::None) {
-    // Check architecture
-    auto arch_probe = util::RunCommandCapture({"uname", "-m"});
-    bool is_arm = (arch_probe.exit_code == 0 && 
-                   util::Trim(arch_probe.output).find("arm") != std::string::npos);
-    
-    if (is_arm) {
-      // Apple Silicon
-      candidates = {"llama-" + release.tag.substr(1) + "-bin-macos-arm64.tar.gz",
-                    "llama-b8580-bin-macos-arm64.tar.gz",
-                    "llama-b8565-bin-macos-arm64.tar.gz"};
-    } else {
-      // Intel Mac
-      candidates = {"llama-" + release.tag.substr(1) + "-bin-macos-x64.tar.gz",
-                    "llama-b8580-bin-macos-x64.tar.gz",
-                    "llama-b8565-bin-macos-x64.tar.gz"};
+  // ── Windows ──────────────────────────────────────────────────────────────
+  const std::string ext = ".zip";
+
+  switch (gpu.backend) {
+    case GpuBackend::Cuda: {
+      std::string cuda = "12.4";
+      if (!gpu.cuda_version.empty()) {
+        cuda = gpu.cuda_version;
+      } else if (!gpu.driver_version.empty()) {
+        int major = 0;
+        sscanf(gpu.driver_version.c_str(), "%d", &major);
+        if (major >= 560)
+          cuda = "13.1";
+        else if (major >= 552)
+          cuda = "12.4";
+      }
+      c.push_back("llama-" + tag + "-bin-win-cuda-" + cuda + "-x64" + ext);
+      // Also offer the CUDA runtime DLLs as a candidate (separate download)
+      c.push_back("cudart-llama-bin-win-cuda-" + cuda + "-x64" + ext);
+      break;
     }
-  } else {
-    // Fallback to ARM for Metal
-    candidates = {"llama-" + release.tag.substr(1) + "-bin-macos-arm64.tar.gz",
-                  "llama-b8580-bin-macos-arm64.tar.gz"};
+    case GpuBackend::Vulkan:
+      c.push_back("llama-" + tag + "-bin-win-vulkan-x64" + ext);
+      break;
+    case GpuBackend::Sycl:
+      c.push_back("llama-" + tag + "-bin-win-sycl-x64" + ext);
+      break;
+    case GpuBackend::Rocm:
+      c.push_back("llama-" + tag + "-bin-win-hip-radeon-x64" + ext);
+      break;
+    case GpuBackend::OpenCL:
+      c.push_back("llama-" + tag + "-bin-win-opencl-adreno-arm64" + ext);
+      break;
+    case GpuBackend::Cpu:
+    case GpuBackend::None:
+    default:
+      c.push_back("llama-" + tag + "-bin-win-cpu-x64" + ext);
+      c.push_back("llama-" + tag + "-bin-win-cpu-arm64" + ext);
+      break;
   }
-  
-#else
-  // Linux binaries
+
+#elif defined(__APPLE__)
+  // ── macOS ────────────────────────────────────────────────────────────────
+  const std::string ext = ".tar.gz";
+
   auto arch_probe = util::RunCommandCapture({"uname", "-m"});
-  bool is_arm = (arch_probe.exit_code == 0 && 
-                 util::Trim(arch_probe.output).find("aarch64") != std::string::npos);
-  
+  bool is_arm = (arch_probe.exit_code == 0 &&
+                 util::Trim(arch_probe.output).find("arm") != std::string::npos);
+
   if (is_arm) {
-    // ARM64 Linux
-    candidates = {"llama-" + release.tag.substr(1) + "-bin-ubuntu-arm64.tar.gz",
-                  "llama-b8580-bin-ubuntu-arm64.tar.gz"};
+    c.push_back("llama-" + tag + "-bin-macos-arm64" + ext);
+  } else {
+    c.push_back("llama-" + tag + "-bin-macos-x64" + ext);
+  }
+
+#else
+  // ── Linux ────────────────────────────────────────────────────────────────
+  const std::string ext = ".tar.gz";
+
+  auto arch_probe = util::RunCommandCapture({"uname", "-m"});
+  bool is_arm = (arch_probe.exit_code == 0 &&
+                 util::Trim(arch_probe.output).find("aarch64") != std::string::npos);
+
+  if (is_arm) {
+    // No pre-built ARM64 Linux binaries currently offered
+    c.push_back("llama-" + tag + "-bin-ubuntu-x64" + ext);
   } else if (gpu.backend == GpuBackend::Cuda) {
-    // Linux CUDA - determine version from driver
-    std::string cuda = "12.4";  // default for Linux
+    std::string cuda = "12.4";
     if (!gpu.cuda_version.empty()) {
       cuda = gpu.cuda_version;
     } else if (!gpu.driver_version.empty()) {
-      // Parse driver version (Linux drivers use same versioning)
-      int major_version = 0;
-      sscanf(gpu.driver_version.c_str(), "%d", &major_version);
-      if (major_version >= 560) {
+      int major = 0;
+      sscanf(gpu.driver_version.c_str(), "%d", &major);
+      if (major >= 560)
         cuda = "13.1";
-      } else if (major_version >= 552) {
+      else if (major >= 552)
         cuda = "12.4";
-      } else {
-        cuda = "11.8";
-      }
     }
-    candidates = {
-        "llama-" + release.tag.substr(1) + "-bin-ubuntu-cuda-" + cuda + "-x64.tar.gz",
-        "llama-b8580-bin-ubuntu-cuda-" + cuda + "-x64.tar.gz",
-        "llama-b8565-bin-ubuntu-cuda-" + cuda + "-x64.tar.gz"};
+    c.push_back("llama-" + tag + "-bin-ubuntu-cuda-" + cuda + "-x64" + ext);
   } else if (gpu.backend == GpuBackend::Rocm) {
-    candidates = {"llama-" + release.tag.substr(1) + "-bin-ubuntu-rocm-7.2-x64.tar.gz",
-                  "llama-b8580-bin-ubuntu-rocm-7.2-x64.tar.gz",
-                  "llama-b8565-bin-ubuntu-rocm-7.2-x64.tar.gz"};
+    c.push_back("llama-" + tag + "-bin-ubuntu-rocm-7.2-x64" + ext);
   } else if (gpu.backend == GpuBackend::Vulkan) {
-    candidates = {"llama-" + release.tag.substr(1) + "-bin-ubuntu-vulkan-x64.tar.gz",
-                  "llama-b8580-bin-ubuntu-vulkan-x64.tar.gz",
-                  "llama-b8565-bin-ubuntu-vulkan-x64.tar.gz"};
-  } else if (gpu.backend == GpuBackend::Cpu) {
-    candidates = {"llama-" + release.tag.substr(1) + "-bin-ubuntu-x64.tar.gz",
-                  "llama-b8580-bin-ubuntu-x64.tar.gz",
-                  "llama-b8565-bin-ubuntu-x64.tar.gz"};
+    c.push_back("llama-" + tag + "-bin-ubuntu-vulkan-x64" + ext);
   } else {
-    // Default to CPU
-    candidates = {"llama-" + release.tag.substr(1) + "-bin-ubuntu-x64.tar.gz",
-                  "llama-b8580-bin-ubuntu-x64.tar.gz"};
-  }
-  
-  if (candidates.empty()) {
-    // Ultimate fallback
-#ifdef _WIN32
-    candidates = {"llama-b8580-bin-win-cpu-x64.zip"};
-#elif defined(__APPLE__)
-    candidates = {"llama-b8580-bin-macos-arm64.tar.gz"};
-#else
-    candidates = {"llama-b8580-bin-ubuntu-x64.tar.gz"};
-#endif
+    // CPU or unknown
+    c.push_back("llama-" + tag + "-bin-ubuntu-x64" + ext);
   }
 #endif
-  auto sys_probe = util::RunCommandCapture({"uname", "-m"});
-  bool is_arm = sys_probe.exit_code == 0 &&
-                util::Trim(sys_probe.output).find("arm") != std::string::npos;
-  if (is_arm) {
-    candidates = {"llama-" + release.tag.substr(1) + "-bin-macos-arm64.tar.gz",
-                  "llama-b8565-bin-macos-arm64.tar.gz"};
-  } else if (gpu.backend == GpuBackend::Metal) {
-    candidates = {"llama-" + release.tag.substr(1) + "-bin-macos-arm64.tar.gz",
-                  "llama-b8565-bin-macos-arm64.tar.gz"};
-  } else if (gpu.backend == GpuBackend::Cuda) {
-    candidates = {"llama-" + release.tag.substr(1) + "-bin-ubuntu-x64.tar.gz",
-                  "llama-b8565-bin-ubuntu-x64.tar.gz"};
-  } else if (gpu.backend == GpuBackend::Vulkan) {
-    candidates = {"llama-" + release.tag.substr(1) + "-bin-ubuntu-vulkan-x64.tar.gz",
-                  "llama-b8565-bin-ubuntu-vulkan-x64.tar.gz"};
-  } else if (gpu.backend == GpuBackend::Rocm) {
-    candidates = {"llama-" + release.tag.substr(1) + "-bin-ubuntu-rocm-7.2-x64.tar.gz",
-                  "llama-b8565-bin-ubuntu-rocm-7.2-x64.tar.gz"};
-  } else {
-    candidates = {"llama-" + release.tag.substr(1) + "-bin-ubuntu-x64.tar.gz",
-                  "llama-b8565-bin-ubuntu-x64.tar.gz"};
+
+  return c;
+}
+
+std::optional<std::string> LlamaDownloader::FindAssetForPlatform(
+    const LlamaRelease& release, const GpuInfo& gpu) const {
+  auto& debug = DebugOverlay::Instance();
+  debug.Debug("FindAssetForPlatform backend=" +
+                  std::to_string(static_cast<int>(gpu.backend)) +
+                  " gpu=" + gpu.name,
+              "Downloader");
+
+  auto candidates = BuildCandidates(release.tag, gpu);
+
+  debug.Debug("Candidates: " + std::to_string(candidates.size()), "Downloader");
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    debug.Debug("  [" + std::to_string(i) + "] " + candidates[i], "Downloader");
   }
-  
-  if (candidates.empty()) {
-    candidates = {"llama-" + release.tag.substr(1) + "-bin-ubuntu-x64.tar.gz",
-                  "llama-b8565-bin-ubuntu-x64.tar.gz"};
-  }
+
+  // Match against actual assets in the release
   for (const auto& candidate : candidates) {
     for (const auto& asset : release.assets) {
       if (asset == candidate) {
+        debug.Debug("Matched: " + candidate, "Downloader");
         return candidate;
       }
     }
   }
+
+  debug.Debug("No matching asset found", "Downloader");
   return std::nullopt;
 }
 

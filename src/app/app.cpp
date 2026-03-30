@@ -27,6 +27,11 @@ App::App()
   fs::create_directories(project_models_dir_);
   fs::create_directories(runtime_dir_);
 
+  // Rotating file logger (5 MB per file, keep 5 files = ~25 MB max)
+  auto logs_dir = fs::current_path() / "logs";
+  logger_.SetFileLogger(
+      std::make_unique<RotatingFileLogger>(logs_dir, "forge-point", 5 * 1024 * 1024, 5));
+
   search_query_ = "Qwen GGUF";
 
   repo_entries_ = {"(none)"};
@@ -56,6 +61,11 @@ App::App()
 
   logger_.Log("Welcome to Forge-Point");
   logger_.Log("Navigate with arrow keys, press Enter to select");
+  logger_.Log("Logs: " + logs_dir.string() + "\\forge-point.log");
+  logger_.Log("Runtime: " + runtime_dir_.string());
+  logger_.Log("GPU: " + gpu_info_.name + " (backend=" +
+              std::to_string(static_cast<int>(gpu_info_.backend)) + ")");
+  logger_.Log("Host: " + default_host_ + ":" + default_port_);
 }
 
 void App::Run() { screen_.Loop(root_); }
@@ -68,7 +78,20 @@ void App::NavigateTo(MenuState state) {
 }
 
 void App::GoBack() {
-  current_state_ = MenuState::Home;
+  switch (current_state_) {
+    case MenuState::Home:
+      // Esc on Home = quit
+      QuitApp();
+      return;
+    case MenuState::Files:
+      // Files -> Search (repos list)
+      current_state_ = MenuState::Search;
+      break;
+    default:
+      // Everything else -> Home
+      current_state_ = MenuState::Home;
+      break;
+  }
   home_selected_ = 0;
   screen_.PostEvent(Event::Custom);
 }
@@ -408,9 +431,25 @@ void App::StopServer() {
 }
 
 void App::CheckHealth() {
-  health_status_ = server_manager_.Health(default_host_, default_port_);
-  logger_.Log("Health: " + health_status_);
-  screen_.PostEvent(Event::Custom);
+  logger_.Log("[health] Checking " + default_host_ + ":" + default_port_ + " ...");
+  SpawnWorker([this] {
+    std::string status = server_manager_.Health(default_host_, default_port_);
+    PostToUi([this, status] {
+      health_status_ = status;
+      logger_.Log("[health] Result: " + health_status_);
+      screen_.PostEvent(Event::Custom);
+    });
+  });
+}
+
+void App::QuitApp() {
+  if (server_manager_.Running()) {
+    logger_.Log("Stopping llama-server...");
+    server_manager_.Stop();
+    logger_.Log("Server stopped.");
+  }
+  logger_.Log("Bye!");
+  screen_.ExitLoopClosure()();
 }
 
 // ─── Commands ────────────────────────────────────────────────────────────────
@@ -514,7 +553,7 @@ void App::RegisterCommands() {
   });
 
   command_handler_.Register("/quit", [this](const auto&) {
-    screen_.ExitLoopClosure()();
+    QuitApp();
   });
   
   command_handler_.Register("/home", [this](const auto&) { NavigateTo(MenuState::Home); });
@@ -561,6 +600,11 @@ void App::BuildUi() {
     }
 
     if (event == Event::Escape) {
+      if (command_input_component_->Focused()) {
+        command_input_.clear();
+        screen_.PostEvent(Event::Custom);
+        return true;
+      }
       GoBack();
       return true;
     }
@@ -592,13 +636,13 @@ void App::BuildUi() {
     }
 
     if (event == Event::CtrlC) {
-      screen_.ExitLoopClosure()();
+      QuitApp();
       return true;
     }
 
     if (event == Event::Character('q')) {
       if (command_input_component_->Focused() && command_input_.empty()) {
-        screen_.ExitLoopClosure()();
+        QuitApp();
         return true;
       }
       if (!command_input_component_->Focused()) {
@@ -616,11 +660,16 @@ void App::BuildUi() {
     }
 
     if (event == Event::Return) {
+      if (command_input_component_->Focused() && !command_input_.empty()) {
+        ExecuteCommandInput();
+        return true;
+      }
       HandleEnterKey();
       return true;
     }
 
     if (event == Event::ArrowUp || event == Event::ArrowDown) {
+      if (command_input_component_->Focused()) return false;
       HandleArrowKeys(event);
       return true;
     }
@@ -1017,7 +1066,16 @@ Element App::BuildServerView() {
       text("Status: ") | dim,
       text(running ? "RUNNING" : "STOPPED") | (running ? color(Color::GreenLight) : color(Color::RedLight)) | bold,
   }));
-  
+
+  if (health_status_ != "not checked") {
+    bool healthy = health_status_.find("ok") != std::string::npos ||
+                   health_status_ == "healthy";
+    rows.push_back(hbox({
+        text("Health: ") | dim,
+        text(health_status_) | (healthy ? color(Color::GreenLight) : color(Color::RedLight)) | bold,
+    }));
+  }
+
   rows.push_back(hbox({text("Host: ") | dim, text(default_host_)}));
   rows.push_back(hbox({text("Port: ") | dim, text(default_port_)}));
   rows.push_back(text(""));

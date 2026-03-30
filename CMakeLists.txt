@@ -63,6 +63,7 @@ add_executable(forge_point
   # App layer
   ${CMAKE_SOURCE_DIR}/src/app/app.cpp
   ${CMAKE_SOURCE_DIR}/src/app/logger.cpp
+  ${CMAKE_SOURCE_DIR}/src/app/rotating_file_logger.cpp
   ${CMAKE_SOURCE_DIR}/src/app/transfer_tracker.cpp
   ${CMAKE_SOURCE_DIR}/src/app/command_registry.cpp
   ${CMAKE_SOURCE_DIR}/src/app/command_handler.cpp
@@ -135,6 +136,7 @@ include(GoogleTest)
 add_executable(forge_point_tests
   # App source files (for linking)
   ${CMAKE_SOURCE_DIR}/src/app/logger.cpp
+  ${CMAKE_SOURCE_DIR}/src/app/rotating_file_logger.cpp
   ${CMAKE_SOURCE_DIR}/src/app/transfer_tracker.cpp
   ${CMAKE_SOURCE_DIR}/src/app/command_registry.cpp
   ${CMAKE_SOURCE_DIR}/src/app/command_handler.cpp

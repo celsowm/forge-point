@@ -20,6 +20,9 @@ class LlamaDownloader {
                           ProgressFn on_dl_progress = nullptr);
 
  private:
+  std::vector<std::string> BuildCandidates(const std::string& tag,
+                                           const GpuInfo& gpu) const;
+
   IHttpClient& http_;
 };
 

@@ -6,12 +6,20 @@ namespace forge {
 
 Logger::Logger(size_t max_logs) : max_logs_(max_logs) {}
 
+void Logger::SetFileLogger(std::unique_ptr<RotatingFileLogger> file_logger) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  file_logger_ = std::move(file_logger);
+}
+
 void Logger::Log(const std::string& message) {
   std::lock_guard<std::mutex> lock(mutex_);
   std::istringstream iss(message);
   std::string part;
   while (std::getline(iss, part)) {
     logs_.push_back(part);
+    if (file_logger_) {
+      file_logger_->Write(part);
+    }
   }
   while (logs_.size() > max_logs_) {
     logs_.erase(logs_.begin());

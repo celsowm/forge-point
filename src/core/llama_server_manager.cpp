@@ -86,10 +86,18 @@ std::string LlamaServerManager::Health(const std::string& host,
                                         const std::string& port) {
   const std::string url = "http://" + host + ":" + port + "/health";
   const auto response = http_.Get(url);
-  if (!response.error.empty() || response.status < 200 || response.status >= 300) {
-    return "unreachable";
+
+  if (!response.error.empty()) {
+    return "unreachable (error: " + response.error + ")";
   }
-  return util::Trim(response.body).empty() ? "healthy" : util::Trim(response.body);
+  if (response.status == 0) {
+    return "unreachable (no response)";
+  }
+  if (response.status < 200 || response.status >= 300) {
+    return "unreachable (HTTP " + std::to_string(response.status) + ")";
+  }
+  auto body = util::Trim(response.body);
+  return body.empty() ? "healthy" : body;
 }
 
 }  // namespace forge
